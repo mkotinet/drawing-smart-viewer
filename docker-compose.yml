@@ -10,7 +10,7 @@ services:
       - "${HOST_PORT:-3095}:8000"
     mem_limit: 256m
     memswap_limit: 512m
-    cpus: 1.0
+    cpu_shares: 512
     oom_score_adj: 500
     environment:
       - TZ=Asia/Seoul
