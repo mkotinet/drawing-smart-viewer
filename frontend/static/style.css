@@ -190,16 +190,18 @@ button, input, select {
 }
 
 .topbar {
-  height: var(--topbar-h);
+  min-height: var(--topbar-h);
   flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 12px;
+  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   z-index: 20;
 }
+
+h1, h2, h3 { text-wrap: balance; }
 
 .topbar-left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .topbar-title { display: flex; align-items: center; gap: 8px; }
@@ -297,15 +299,16 @@ button, input, select {
 }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 
-.category-strip, .subcat-strip {
+.rev-strip, .category-strip, .subcat-strip {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 10px 10px 8px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.subcat-strip { background: var(--surface-elev); padding: 8px 10px; }
+.rev-strip { background: var(--bg); }
+.subcat-strip { background: var(--surface-elev); }
 
 .chip {
   display: inline-flex;
@@ -727,10 +730,118 @@ dialog::backdrop {
   color: var(--text-muted);
 }
 
+.badge-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.search-snippet {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.search-snippet mark {
+  background: rgba(245, 158, 11, 0.28);
+  color: var(--text);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.sibling-jump {
+  width: 48px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.canvas-viewport.pin-mode { cursor: crosshair; }
+.pin-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+.pin-marker {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 12px 12px 12px 2px;
+  border: 2px solid #fff;
+  background: var(--warn);
+  color: #111827;
+  font-size: 11px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  cursor: pointer;
+}
+.pin-list-box {
+  padding: 10px;
+  background: var(--surface-elev);
+  border-bottom: 1px solid var(--border);
+  max-height: 190px;
+  overflow-y: auto;
+}
+.pin-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.pin-item-body { flex: 1; min-width: 0; cursor: pointer; }
+.pin-item-note { color: var(--text); word-break: break-word; }
+.pin-item-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.admin-users-section {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.admin-users-section h2 { margin: 0 0 8px; font-size: 14px; }
+.admin-user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.admin-user-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto auto;
+  gap: 6px;
+  margin-top: 10px;
+}
+.admin-user-form input, .admin-user-form select {
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  min-width: 0;
+}
+
 /* ── Toast ── */
 .toast {
   position: fixed;
-  bottom: 20px;
+  bottom: max(20px, calc(12px + env(safe-area-inset-bottom, 0px)));
   left: 50%;
   transform: translateX(-50%);
   padding: 9px 16px;
@@ -743,6 +854,25 @@ dialog::backdrop {
   z-index: 60;
 }
 
+/* ── Touch Targets (WCAG 2.5.5 / modern-web-guidance: form-factor-adaptation) ── */
+@media (pointer: coarse) {
+  .icon-btn, .icon-btn-sm, .zoom-btn, .search-clear {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .btn-sm, .chip {
+    min-height: 36px;
+  }
+  .btn, .icon-btn, .icon-btn-sm, .chip, .tab-btn {
+    touch-action: manipulation;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+  * { transition-duration: 0.01ms !important; }
+}
+
 /* ── Mobile Responsive (< 900px) ── */
 @media (max-width: 900px) {
   .stat-pill { display: none; }
@@ -752,6 +882,7 @@ dialog::backdrop {
     width: min(88vw, 340px);
     z-index: 30;
     box-shadow: var(--shadow);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .inspector {
     position: absolute;
@@ -765,7 +896,9 @@ dialog::backdrop {
     border-radius: 14px 14px 0 0;
     z-index: 35;
     box-shadow: var(--shadow);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .doc-sub { display: none; }
-  .zoom-controls { right: 10px; bottom: 12px; }
+  .zoom-controls { right: max(10px, env(safe-area-inset-right, 0px)); bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
+  .admin-user-form { grid-template-columns: 1fr 1fr; }
 }

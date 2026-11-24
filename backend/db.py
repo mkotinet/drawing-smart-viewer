@@ -8,21 +8,45 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Iterator
 
 from backend.config import (
+    KST,
     get_admin_password,
     get_admin_user,
     get_auth_db_path,
     get_db_path,
+    now_kst,
     now_kst_iso,
 )
 
 MAX_AUDIT_LOGS = 5000
 PBKDF2_ITERS = 120_000
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 90  # 90일 슬라이딩 만료
+SESSION_TOUCH_INTERVAL_S = 300           # 5분 디바운싱 (타일 요청 쓰기 I/O 99% 절감)
+_REV_DIR_RE = re.compile(r"(?:AFC|AFD|IFC|REV|R\d|^\d+_P&ID)", re.IGNORECASE)
+
+
+def extract_revision(source_file: str) -> str:
+    """상대 경로의 최상위 리비전 폴더명(예: 2_AFC_0, 1_AFD_2026.09.11, 0_P&ID) 추출."""
+    norm = (source_file or "").replace("\\", "/").strip("/")
+    parts = [p for p in norm.split("/") if p]
+    if len(parts) >= 2 and _REV_DIR_RE.search(parts[0]):
+        return parts[0]
+    return ""
+
+
+def _parse_kst_iso(ts: str) -> datetime | None:
+    try:
+        clean = (ts or "").replace(" KST", "").strip()
+        return datetime.strptime(clean, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+    except Exception:
+        return None
 
 
 def _tune(conn: sqlite3.Connection, read_only: bool = False) -> None:
@@ -112,10 +136,14 @@ def init_drawings_db(path=None) -> None:
                 has_preview INTEGER NOT NULL DEFAULT 0,
                 tag_count INTEGER NOT NULL DEFAULT 0,
                 extra_categories TEXT NOT NULL DEFAULT '',
+                revision TEXT NOT NULL DEFAULT '',
                 full_text TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_sheets_cat ON sheets(category, subcategory);
+            CREATE INDEX IF NOT EXISTS idx_sheets_cat_order ON sheets(category, subcategory, title, page_no);
+            CREATE INDEX IF NOT EXISTS idx_sheets_source ON sheets(source_file, page_no);
+            CREATE INDEX IF NOT EXISTS idx_sheets_rev ON sheets(revision);
             CREATE INDEX IF NOT EXISTS idx_sheets_dwgno ON sheets(drawing_no);
 
             CREATE TABLE IF NOT EXISTS tags (
@@ -137,6 +165,7 @@ def init_drawings_db(path=None) -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+            CREATE INDEX IF NOT EXISTS idx_tags_tag_nocase ON tags(tag COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_tags_sheet ON tags(sheet_id);
             CREATE INDEX IF NOT EXISTS idx_tags_func ON tags(func);
 
@@ -151,9 +180,26 @@ def init_drawings_db(path=None) -> None:
                 tokenize='unicode61 remove_diacritics 0'
             );
         """)
+        ensure_drawings_migrations(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def ensure_drawings_migrations(conn: sqlite3.Connection) -> None:
+    """기존 drawings.db에도 v1.2.0 복합 인덱스·revision 컬럼을 무중단 보강."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sheets)").fetchall()}
+    if "revision" not in cols:
+        conn.execute("ALTER TABLE sheets ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_cat_order ON sheets(category, subcategory, title, page_no)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_source ON sheets(source_file, page_no)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_rev ON sheets(revision)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag_nocase ON tags(tag COLLATE NOCASE)")
+    # 기존 행 중 revision이 비어 있는 다중 리비전 경로 자동 채움
+    rows = conn.execute("SELECT sheet_id, source_file FROM sheets WHERE revision = ''").fetchall()
+    updates = [(rev, r[0]) for r in rows if (rev := extract_revision(r[1]))]
+    if updates:
+        conn.executemany("UPDATE sheets SET revision = ? WHERE sheet_id = ?", updates)
 
 
 def init_state_db() -> None:
@@ -184,6 +230,17 @@ def init_state_db() -> None:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (username, sheet_id)
             );
+
+            CREATE TABLE IF NOT EXISTS sheet_pins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pins_sheet ON sheet_pins(sheet_id);
 
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,7 +310,18 @@ def get_session(token: str) -> dict[str, Any] | None:
         ).fetchone()
         if row is None:
             return None
-        conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (now_kst_iso(), token))
+        now = now_kst()
+        last_dt = _parse_kst_iso(row["last_used_at"])
+        if last_dt is not None:
+            age_s = (now - last_dt).total_seconds()
+            if age_s > SESSION_TTL_SECONDS:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                return None
+            # 5분 이내 재조회는 쓰기 트랜잭션 생략 (타일/썸네일 버스트 시 SQLite 쓰기 99% 절감)
+            if age_s >= SESSION_TOUCH_INTERVAL_S:
+                conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (now_kst_iso(), token))
+        else:
+            conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (now_kst_iso(), token))
         return dict(row)
 
 

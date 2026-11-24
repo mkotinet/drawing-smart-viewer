@@ -37,7 +37,7 @@ from pypdf import PdfReader, PdfWriter
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from backend.db import init_drawings_db  # noqa: E402
+from backend.db import extract_revision, init_drawings_db  # noqa: E402
 
 KST = timezone(timedelta(hours=9), "KST")
 
@@ -61,6 +61,46 @@ RE_STD_INST = re.compile(r"\b(?:(?P<unit>[A-Z0-9]{1,4})-)?(?P<func>[A-Z]{2,5})-(
 RE_LINE_NO = re.compile(r'\b\d{1,3}(?:"|A)-[A-Z]{2,5}-\d{3,5}(?:-[A-Z0-9]{2,6})?\b')
 RE_DWG_NO = re.compile(r"\b[A-Z]{2}\d{4}-[A-Z0-9]{4}-[A-Z0-9]{3,4}-[A-Z0-9]{4}-[A-Z0-9]{4,5}\b")
 RE_EQUIP = re.compile(r"\b(?:AHU|FCU|EF|SF|CHW|CT|HX|TK|PU|P|E|V|C|B|T|MCP|PLC|DDC|MCC|PNL|JB)-\d{2,4}[A-Z]?\b")
+RE_TAG_CANDIDATE = re.compile(r"[A-Z]{2,5}\s*[-/\n]?\s*\d{2,5}")
+
+# 배관 호칭경(KS/JIS), 압력등급, 전원 표기, 프로젝트 코드 등 비계기 오탐 차단 목록
+_PIPE_DN_SIZES = frozenset({
+    "10A", "15A", "20A", "25A", "32A", "40A", "50A", "65A", "80A",
+    "100A", "125A", "150A", "200A", "250A", "300A", "350A", "400A", "500A",
+})
+_SPEC_LOOPS = frozenset({"10K", "20K", "110V", "220V", "380V", "440V", "50HZ", "60HZ"})
+_RE_PROJECT_CODE = re.compile(r"^(?:SF|PJ|PRJ|JOB)-\d{4}$")
+
+
+def is_valid_tag(tag: str, kind: str, func: str | None = None,
+                 unit: str | None = None, loop: str | None = None) -> bool:
+    """프로젝트 코드·배관 호칭경(15A/25A)·압력등급(10K)·전원(220V) 등 오탐 태그를 걸러낸다."""
+    t = (tag or "").strip().upper()
+    if not t:
+        return False
+    if _RE_PROJECT_CODE.match(t):
+        return False
+    parts = t.split("-")
+    tail = (loop or parts[-1]).upper()
+    if kind != "line_no" and (tail in _PIPE_DN_SIZES or tail in _SPEC_LOOPS):
+        return False
+    # KS-KS-10K, AC-AC-220V 같은 기능문자 반복 노이즈 제거
+    if func and unit and func.upper() == unit.upper():
+        return False
+    if len(parts) >= 2 and parts[0] == parts[1]:
+        return False
+    if kind == "instrument" and tail.endswith(("V", "K", "W", "HZ")):
+        return False
+    return True
+
+
+def is_shx_vector_text(full_text: str) -> bool:
+    """AutoCAD SHX 벡터 선분으로 변환되어 검색 텍스트가 'M' 더미 위주인 P&ID 페이지를 판별."""
+    tokens = [w for w in (full_text or "").split() if w]
+    if not tokens:
+        return True
+    m_dummy = sum(1 for w in tokens if set(w) <= {"M", "*"})
+    return (m_dummy >= 10 and (m_dummy / len(tokens)) >= 0.25) or len(full_text.strip()) < 60
 
 TILE_SIZE = 1024
 THUMB_W = 480
@@ -153,8 +193,11 @@ def extract_page_tokens(page) -> tuple[str, list[dict[str, Any]]]:
         n_chars = tp.count_chars()
         if n_chars <= 0:
             return full_text, []
+        # 태그 후보 패턴이 전혀 없는 표지·SHX 벡터 페이지는 6만 회 charbox 조회 생략 (DS920+ 고속화)
+        if not RE_TAG_CANDIDATE.search(full_text.upper()):
+            return full_text, []
 
-        # 연속된 비공백 문자 묶음을 단어로 결합 + bbox 계산
+        # 연속된 비공백 문자 묶음을 단어로 결합 + bbox 계산 (1회 벌크 텍스트 추출)
         words: list[dict[str, Any]] = []
         buf: list[str] = []
         x0, y0, x1, y1 = 1e9, 1e9, -1e9, -1e9
@@ -175,10 +218,11 @@ def extract_page_tokens(page) -> tuple[str, list[dict[str, Any]]]:
             buf = []
             x0, y0, x1, y1 = 1e9, 1e9, -1e9, -1e9
 
-        # 문자수가 극단적으로 큰 경우 상한 보호
         limit = min(n_chars, 60_000)
+        bulk_chars = tp.get_text_range(0, limit)
+        use_bulk = len(bulk_chars) == limit
         for idx in range(limit):
-            ch = tp.get_text_range(idx, 1)
+            ch = bulk_chars[idx] if use_bulk else tp.get_text_range(idx, 1)
             if not ch or ch.isspace():
                 flush()
                 continue
@@ -208,6 +252,8 @@ def extract_tags_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]
 
     def add(tag: str, kind: str, func: str | None, unit: str | None, loop: str | None,
             x0: float, y0: float, x1: float, y1: float, conf: float, raw: str):
+        if not is_valid_tag(tag, kind, func, unit, loop):
+            return
         key = (tag, round(x0 * 100), round(y0 * 100))
         if key in seen_pos:
             return
@@ -332,19 +378,19 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
             pil_img: Image.Image = bitmap.to_pil().convert("RGB")
             w_px, h_px = pil_img.size
 
-            # 1) 썸네일 저장
+            # 1) 썸네일 저장 (DS920+ 인코딩 최적화: BILINEAR + WebP method=2)
             thumb_dir = out_dir / "thumbs"
             thumb_dir.mkdir(parents=True, exist_ok=True)
             thumb = pil_img.copy()
-            thumb.thumbnail((THUMB_W, THUMB_W), Image.Resampling.LANCZOS)
-            thumb.save(thumb_dir / f"{sheet_id}.webp", "WEBP", quality=76, method=4)
+            thumb.thumbnail((THUMB_W, THUMB_W), Image.Resampling.BILINEAR)
+            thumb.save(thumb_dir / f"{sheet_id}.webp", "WEBP", quality=76, method=2)
 
             # 2) 프리뷰 이미지 + 타일 피라미드 저장
             s_tile_dir = out_dir / "tiles" / sheet_id
             s_tile_dir.mkdir(parents=True, exist_ok=True)
             prev = pil_img.copy()
-            prev.thumbnail((PREVIEW_W, PREVIEW_W), Image.Resampling.LANCZOS)
-            prev.save(s_tile_dir / "preview.webp", "WEBP", quality=82, method=4)
+            prev.thumbnail((PREVIEW_W, PREVIEW_W), Image.Resampling.BILINEAR)
+            prev.save(s_tile_dir / "preview.webp", "WEBP", quality=82, method=2)
 
             tile_cols, tile_rows = 0, 0
             if w_px > PREVIEW_W or h_px > PREVIEW_W:
@@ -355,7 +401,7 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
                         x0 = c * TILE_SIZE
                         y0 = r * TILE_SIZE
                         crop = pil_img.crop((x0, y0, min(x0 + TILE_SIZE, w_px), min(y0 + TILE_SIZE, h_px)))
-                        crop.save(s_tile_dir / f"{c}_{r}.webp", "WEBP", quality=82, method=4)
+                        crop.save(s_tile_dir / f"{c}_{r}.webp", "WEBP", quality=82, method=2)
 
             pil_img.close()
             page.close()
@@ -379,10 +425,13 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
             except Exception:
                 has_pdf = 0
 
+            shx_note = "SHX 벡터 도면" if (is_pid and not tags and is_shx_vector_text(full_text)) else ""
+            merged_extra = ", ".join(x for x in (extra_cats, shx_note) if x)
             results.append({
                 "sheet_id": sheet_id,
                 "category": category,
                 "subcategory": subcategory,
+                "revision": extract_revision(rel_str),
                 "drawing_no": drawing_no,
                 "title": title,
                 "source_file": rel_str,
@@ -397,7 +446,7 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
                 "sha256": sha256,
                 "has_pdf": has_pdf,
                 "has_preview": 1,
-                "extra_categories": extra_cats,
+                "extra_categories": merged_extra,
                 "full_text": full_text[:20_000],
                 "tags": tags,
             })
@@ -561,11 +610,20 @@ def _load_existing_by_sha(db_path: Path, out_dir: Path) -> tuple[dict[str, list[
     try:
         meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta").fetchall()}
         sheet_rows = [dict(r) for r in conn.execute("SELECT * FROM sheets").fetchall()]
+        fts_texts: dict[str, str] = {}
+        try:
+            for fr in conn.execute("SELECT sheet_id, full_text FROM sheets_fts").fetchall():
+                if fr["full_text"]:
+                    fts_texts[fr["sheet_id"]] = fr["full_text"]
+        except sqlite3.Error:
+            pass
         tags_by_sheet: dict[str, list[dict[str, Any]]] = {}
         for tr in conn.execute(
             "SELECT sheet_id, tag, kind, func, unit, loop, x0, y0, x1, y1, confidence, source, raw_text FROM tags"
         ).fetchall():
             d = dict(tr)
+            if not is_valid_tag(d["tag"], d["kind"], d["func"], d["unit"], d["loop"]):
+                continue
             tags_by_sheet.setdefault(d.pop("sheet_id"), []).append(d)
     except sqlite3.Error:
         return {}, {}
@@ -575,6 +633,10 @@ def _load_existing_by_sha(db_path: Path, out_dir: Path) -> tuple[dict[str, list[
     by_sha: dict[str, list[dict[str, Any]]] = {}
     for s in sheet_rows:
         s["tags"] = tags_by_sheet.get(s["sheet_id"], [])
+        if not s.get("full_text"):
+            s["full_text"] = fts_texts.get(s["sheet_id"], "")
+        if not s.get("revision"):
+            s["revision"] = extract_revision(s.get("source_file", ""))
         by_sha.setdefault(s["sha256"], []).append(s)
 
     # 디스크에 썸네일·프리뷰가 실제로 남아 있는 sha256만 재사용 가능으로 인정
@@ -599,6 +661,7 @@ def _write_drawings_db_atomic(
     out_dir: Path,
     all_sheets: list[dict[str, Any]],
     meta: dict[str, str],
+    run_vacuum: bool = True,
 ) -> tuple[int, int]:
     """임시 DB(.drawings.db.staging)에 전체 시트·FTS5를 기록한 뒤 drawings.db로 원자 교체."""
     staging = out_dir / ".drawings.db.staging"
@@ -623,26 +686,28 @@ def _write_drawings_db_atomic(
             s["sheet_id"] = sid
         seen_ids.add(sid)
 
-        tags = s.get("tags", [])
+        tags = [t for t in s.get("tags", []) if is_valid_tag(t["tag"], t["kind"], t.get("func"), t.get("unit"), t.get("loop"))]
         total_tags += len(tags)
         for t in tags:
             unique_tags_set.add(t["tag"])
         tags_joined = " ".join(sorted({t["tag"] for t in tags}))
+        rev = s.get("revision") or extract_revision(s.get("source_file", ""))
 
+        # sheets 본 테이블은 full_text 중복 저장을 생략(sheets_fts에만 저장 → DB ~40% 절감)
         conn.execute(
             """
             INSERT INTO sheets(
-                sheet_id, category, subcategory, drawing_no, title, source_file, file_type,
+                sheet_id, category, subcategory, revision, drawing_no, title, source_file, file_type,
                 page_no, total_pages, width_px, height_px, tile_cols, tile_rows, tile_size,
                 sha256, has_pdf, has_preview, tag_count, extra_categories, full_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
             """,
             (
-                sid, s["category"], s["subcategory"], s["drawing_no"], s["title"],
+                sid, s["category"], s["subcategory"], rev, s["drawing_no"], s["title"],
                 s["source_file"], s["file_type"], s["page_no"], s["total_pages"],
                 s["width_px"], s["height_px"], s["tile_cols"], s["tile_rows"], s["tile_size"],
                 s["sha256"], s["has_pdf"], s["has_preview"], len(tags),
-                s.get("extra_categories", ""), s.get("full_text", ""),
+                s.get("extra_categories", ""),
             ),
         )
         if tags:
@@ -670,7 +735,8 @@ def _write_drawings_db_atomic(
     conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", list(meta.items()))
     conn.execute("INSERT INTO sheets_fts(sheets_fts) VALUES('optimize')")
     conn.commit()
-    conn.execute("VACUUM")
+    if run_vacuum:
+        conn.execute("VACUUM")
     conn.close()
 
     for suffix in ("-wal", "-shm"):
@@ -735,18 +801,23 @@ def build_index_incremental(
 
     for sha, entry in by_hash.items():
         if sha in existing_by_sha:
+            rev = extract_revision(entry["rel_str"])
             for s in existing_by_sha[sha]:
+                prev_shx = "SHX 벡터 도면" if "SHX 벡터 도면" in s.get("extra_categories", "") else ""
+                want_extra = ", ".join(x for x in (entry["extra_categories"], prev_shx) if x)
                 if (
                     s["category"] != entry["category"]
                     or s["subcategory"] != entry["subcategory"]
+                    or s.get("revision", "") != rev
                     or s["source_file"] != entry["rel_str"]
-                    or s.get("extra_categories", "") != entry["extra_categories"]
+                    or s.get("extra_categories", "") != want_extra
                 ):
                     meta_changed = True
                     s["category"] = entry["category"]
                     s["subcategory"] = entry["subcategory"]
+                    s["revision"] = rev
                     s["source_file"] = entry["rel_str"]
-                    s["extra_categories"] = entry["extra_categories"]
+                    s["extra_categories"] = want_extra
                 reused_sheets.append(s)
         else:
             new_jobs.append(entry)
@@ -788,7 +859,7 @@ def build_index_incremental(
                 "failed_so_far": len(failed),
             })
 
-    def _checkpoint() -> tuple[int, int]:
+    def _checkpoint(final: bool = False) -> tuple[int, int]:
         meta = {
             "project": effective_project,
             "built_at_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
@@ -796,7 +867,7 @@ def build_index_incremental(
             "unique_pdfs": str(len(by_hash)),
             "failed_count": str(len(failed)),
         }
-        return _write_drawings_db_atomic(out_dir, reused_sheets + added_sheets, meta)
+        return _write_drawings_db_atomic(out_dir, reused_sheets + added_sheets, meta, run_vacuum=final)
 
     _emit_progress(0)
     if workers <= 1:
@@ -812,7 +883,7 @@ def build_index_incremental(
             gc.collect()
             _emit_progress(idx)
             if batch_commit > 0 and idx % batch_commit == 0 and idx < len(new_jobs):
-                _checkpoint()
+                _checkpoint(final=False)
             if sheet_sleep > 0:
                 time.sleep(sheet_sleep)
     else:
@@ -831,7 +902,7 @@ def build_index_incremental(
                     print(f"  [경고] 증분 건너뜀: {job['rel_str']} — {exc}")
                 _emit_progress(done)
 
-    total_tags, unique_tags = _checkpoint()
+    total_tags, unique_tags = _checkpoint(final=True)
 
     # 최종 원자 교체 완료 후 삭제된 시트의 고아 파일 안전 정리
     active_ids = {s["sheet_id"] for s in (reused_sheets + added_sheets)}

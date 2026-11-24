@@ -46,6 +46,7 @@ services:
       - DATA_DIR=/app/data
       - WORKER_STATE_DIR=/app/worker_state
       - GDRIVE_REMOTE_PATH=${GDRIVE_REMOTE_PATH}
+      - GDRIVE_ROOT_FOLDER_ID=${GDRIVE_ROOT_FOLDER_ID:-}
       - RCLONE_CONF_B64=${RCLONE_CONF_B64}
       - PROJECT_NAME=${PROJECT_NAME:-도면 프로젝트}
       - SYNC_INTERVAL_MIN=${SYNC_INTERVAL_MIN:-15}

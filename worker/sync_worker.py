@@ -42,6 +42,7 @@ RCLONE_HASH_PATH = STATE_DIR / ".rclone_env.sha256"
 STATUS_FILE = DATA_DIR / "sync_status.json"
 
 GDRIVE_REMOTE_PATH = os.environ.get("GDRIVE_REMOTE_PATH", "").strip()
+GDRIVE_ROOT_FOLDER_ID = os.environ.get("GDRIVE_ROOT_FOLDER_ID", "").strip()
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "도면 프로젝트").strip() or "도면 프로젝트"
 SYNC_INTERVAL_MIN = max(1, int(os.environ.get("SYNC_INTERVAL_MIN", "15")))
 SYNC_TOKEN = os.environ.get("SYNC_TOKEN", "").strip()
@@ -139,32 +140,69 @@ def notify_n8n(event: str, payload: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
-def _run_rclone_sync(conf_path: Path) -> dict[str, Any]:
-    """구글 드라이브 감시 폴더의 PDF만 로컬 캐시와 동기화(DWG/대용량 바이너리 제외)."""
-    if not GDRIVE_REMOTE_PATH:
-        raise RuntimeError("GDRIVE_REMOTE_PATH 환경변수가 비어 있습니다")
+def _run_rclone_sync(conf_path: Path, started_at: str) -> dict[str, Any]:
+    """구글 드라이브 감시 폴더의 PDF만 로컬 캐시와 동기화(서브경로 풀스캔 방지 + 실시간 진행률 파싱)."""
+    if not GDRIVE_REMOTE_PATH and not GDRIVE_ROOT_FOLDER_ID:
+        raise RuntimeError("GDRIVE_REMOTE_PATH 또는 GDRIVE_ROOT_FOLDER_ID 환경변수가 필요합니다")
+
+    # --drive-root-folder-id가 설정되면 루트 탐색 없이 감시 폴더 ID에서 직결 시작
+    remote_arg = GDRIVE_REMOTE_PATH
+    extra_flags: list[str] = []
+    if GDRIVE_ROOT_FOLDER_ID:
+        remote_name = (GDRIVE_REMOTE_PATH.split(":", 1)[0] if ":" in GDRIVE_REMOTE_PATH else "gdrive_personal").strip()
+        remote_arg = f"{remote_name}:"
+        extra_flags = ["--drive-root-folder-id", GDRIVE_ROOT_FOLDER_ID]
+
+    # 주의: Google Drive 서브경로에서 --fast-list 사용 시 전체 드라이브를 풀스캔하므로 배제
     cmd = [
         "rclone", "sync",
-        GDRIVE_REMOTE_PATH,
+        remote_arg,
         str(RAW_CACHE_DIR),
         "--config", str(conf_path),
+        *extra_flags,
         "--ignore-case",
         "--include", "*.pdf",
         "--delete-excluded",
-        "--transfers", "2",
-        "--checkers", "4",
-        "--fast-list",
+        "--transfers", "3",
+        "--checkers", "6",
         "--contimeout", "30s",
         "--timeout", "120s",
         "--stats-one-line",
-        "--stats", "0",
+        "--stats", "3s",
+        "-v",
     ]
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    tail_lines: list[str] = []
+    deadline = t0 + 1800
+    last_push = 0.0
+    assert proc.stderr is not None
+    for raw_line in proc.stderr:
+        line = raw_line.strip()
+        if not line:
+            continue
+        tail_lines.append(line)
+        if len(tail_lines) > 25:
+            tail_lines.pop(0)
+        now_t = time.perf_counter()
+        if now_t > deadline:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError("rclone sync 타임아웃 (1800초 초과)")
+        if ("Transferred:" in line or "ETA" in line or "%" in line) and (now_t - last_push >= 2.5):
+            last_push = now_t
+            _update_status(
+                state="syncing_drive",
+                progress={
+                    "phase": f"구글 드라이브 동기화 중: {line[:120]}",
+                    "started_at": started_at,
+                },
+            )
+    rc = proc.wait(timeout=30)
     elapsed = round(time.perf_counter() - t0, 2)
-    if proc.returncode != 0:
-        err_tail = (proc.stderr or proc.stdout or "")[-600:].strip()
-        raise RuntimeError(f"rclone sync 실패 (exit={proc.returncode}): {err_tail}")
+    if rc != 0:
+        err_tail = "\n".join(tail_lines[-8:])[:600].strip()
+        raise RuntimeError(f"rclone sync 실패 (exit={rc}): {err_tail}")
     return {"rclone_elapsed_sec": elapsed}
 
 
@@ -182,7 +220,7 @@ def run_sync_cycle(reason: str = "scheduled", force_notify: bool = False) -> dic
             progress={"phase": "구글 드라이브 변경 파일 확인 중...", "started_at": started_at},
         )
         conf_path = ensure_rclone_config()
-        rclone_info = _run_rclone_sync(conf_path)
+        rclone_info = _run_rclone_sync(conf_path, started_at)
 
         _update_status(
             state="indexing",

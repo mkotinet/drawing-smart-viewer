@@ -6,10 +6,12 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.1.0';
-  const TOKEN_KEY = 'dsv_auth_token';
+  const APP_VERSION = '1.2.0';
   const USER_KEY = 'dsv_auth_user';
   const THEME_KEY = 'dsv_theme';
+  const TILE_CACHE_NAME = 'dsv-tiles-v1.0.0';
+  // 구버전 localStorage 세션 토큰 잔여분 자동 제거 (HttpOnly 쿠키 일원화)
+  try { localStorage.removeItem('dsv_auth_token'); } catch (_) {}
 
   // 1) PWA beforeinstallprompt 최우선 캡처 (§15)
   let deferredPrompt = null;
@@ -32,10 +34,10 @@
 
   // 3) 상태
   const state = {
-    token: localStorage.getItem(TOKEN_KEY) || '',
     user: JSON.parse(localStorage.getItem(USER_KEY) || 'null'),
     lastKstDate: getKSTDateString(),
     tab: 'drawings',
+    revision: '',
     category: '',
     subcategory: '',
     q: '',
@@ -44,7 +46,11 @@
     stats: null,
     sheet: null,
     selectedTagId: null,
+    selectedTagName: '',
     showBoxes: true,
+    pinMode: false,
+    pendingPin: null,
+    openReqSeq: 0,
     // 뷰포트 변환
     scale: 1,
     tx: 0,
@@ -57,7 +63,24 @@
     pinchStartScale: 1,
     pinchCenter: null,
     dragStart: null,
+    pointerMoved: false,
   };
+
+  function syncUrlState() {
+    const u = new URL(location.href);
+    const setOrDel = (k, v) => (v ? u.searchParams.set(k, v) : u.searchParams.delete(k));
+    setOrDel('sheet', state.sheet?.sheet_id || '');
+    setOrDel('tag', state.selectedTagName || '');
+    setOrDel('q', state.q || '');
+    setOrDel('rev', state.revision || '');
+    setOrDel('cat', state.category || '');
+    history.replaceState(null, '', u.pathname + u.search);
+  }
+
+  function renderSnippetHtml(raw) {
+    if (!raw) return '';
+    return escapeHtml(raw).replace(/\[\[H\]\]/g, '<mark>').replace(/\[\[\/H\]\]/g, '</mark>');
+  }
 
   const $ = (id) => document.getElementById(id);
 
@@ -69,10 +92,9 @@
     t._timer = setTimeout(() => { t.hidden = true; }, ms);
   }
 
-  // 4) 인증 API 래퍼 — 오직 명시적 401일 때만 토큰 파기 (§9)
+  // 4) 인증 API 래퍼 — HttpOnly 쿠키 전용, 오직 명시적 401일 때만 세션 파기 (§9)
   async function api(url, opts = {}) {
     const headers = { ...(opts.headers || {}) };
-    if (state.token) headers['Authorization'] = `Bearer ${state.token}`;
     if (opts.body && !(opts.body instanceof FormData)) {
       headers['Content-Type'] = 'application/json';
     }
@@ -83,17 +105,22 @@
     }
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
-      try { detail = (await res.json()).detail || detail; } catch (_) {}
+      try {
+        const j = await res.json();
+        detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail || detail);
+      } catch (_) {}
       throw new Error(detail);
     }
     return res.json();
   }
 
   function clearSession() {
-    state.token = '';
     state.user = null;
-    localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
+    // 로그아웃/만료 시 공용 기기 브라우저 캐시에서 도면 타일 즉시 파기
+    if ('caches' in window) {
+      caches.delete(TILE_CACHE_NAME).catch(() => {});
+    }
     $('appShell').hidden = true;
     $('authScreen').hidden = false;
   }
@@ -116,19 +143,27 @@
     });
   }
 
-  // 6) 테마
-  function applyTheme(theme) {
+  // 6) 테마 (시스템 다크/라이트 변경 감지 포함 — modern-web-guidance: dark-mode)
+  function applyTheme(theme, persist = true) {
     if (theme === 'light') {
       document.documentElement.setAttribute('data-theme', 'light');
     } else {
       document.documentElement.removeAttribute('data-theme');
     }
-    localStorage.setItem(THEME_KEY, theme);
+    if (persist) localStorage.setItem(THEME_KEY, theme);
   }
+
+  const colorSchemeMq = window.matchMedia('(prefers-color-scheme: dark)');
+  colorSchemeMq.addEventListener?.('change', (e) => {
+    if (!localStorage.getItem(THEME_KEY)) {
+      applyTheme(e.matches ? 'dark' : 'light', false);
+    }
+  });
 
   // 7) 초기 인증 부팅
   async function boot() {
-    applyTheme(localStorage.getItem(THEME_KEY) || 'dark');
+    const savedTheme = localStorage.getItem(THEME_KEY);
+    applyTheme(savedTheme || (colorSchemeMq.matches ? 'dark' : 'light'), false);
     initDialogLightDismiss();
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
@@ -154,20 +189,44 @@
     }
   }
 
-  function enterApp() {
+  let initialDeepLinkHandled = false;
+
+  async function enterApp() {
     $('authScreen').hidden = true;
     $('appShell').hidden = false;
     $('userDisplay').textContent = state.user?.username || '사용자';
     $('btnAuditLog').hidden = !state.user?.is_admin;
     $('btnSyncDrive').hidden = !state.user?.is_admin;
-    if (window.innerWidth <= 900) {
-      // 모바일에서는 도면 목록을 먼저 보여 선택 유도
-      $('sidebar').classList.remove('collapsed');
+
+    let initSheet = '';
+    let initTag = '';
+    if (!initialDeepLinkHandled) {
+      initialDeepLinkHandled = true;
+      const sp = new URLSearchParams(location.search);
+      state.q = (sp.get('q') || '').trim();
+      state.revision = (sp.get('rev') || '').trim();
+      state.category = (sp.get('cat') || '').trim();
+      initSheet = (sp.get('sheet') || '').trim();
+      initTag = (sp.get('tag') || '').trim();
+      if (state.q) {
+        $('globalSearchInput').value = state.q;
+        $('btnClearSearch').hidden = false;
+      }
     }
-    loadStatsAndList();
+
+    if (window.innerWidth <= 900 && !initSheet) {
+      $('sidebar').classList.remove('collapsed');
+    } else if (window.innerWidth <= 900 && initSheet) {
+      $('sidebar').classList.add('collapsed');
+    }
+
+    await loadStatsAndList();
+    if (initSheet) {
+      await openSheet(initSheet, initTag || null);
+    }
   }
 
-  // 8) 통계 & 카테고리/목록 로드
+  // 8) 통계 & 리비전/카테고리/목록 로드
   async function loadStatsAndList() {
     try {
       const stats = await api('/api/stats');
@@ -177,11 +236,41 @@
         document.title = `${stats.meta.project} — 도면 스마트 뷰어`;
       }
       $('statBadge').textContent = `도면 ${stats.total_sheets.toLocaleString()}장 · 태그 ${stats.unique_tags.toLocaleString()}종`;
+      renderRevisions(stats.revisions || []);
       renderCategories(stats.categories || []);
     } catch (err) {
       if (err.message !== 'AUTH_401') showToast(`통계 조회 실패: ${err.message}`);
     }
     await refreshList();
+  }
+
+  function renderRevisions(revs) {
+    const strip = $('revisionStrip');
+    if (!revs || revs.length <= 1) {
+      strip.hidden = true;
+      strip.innerHTML = '';
+      return;
+    }
+    strip.hidden = false;
+    strip.innerHTML = '';
+    const mk = (label, count, active, val) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip' + (active ? ' active' : '');
+      b.innerHTML = `<span>${escapeHtml(label)}</span><span class="cnt">${count}</span>`;
+      b.addEventListener('click', () => {
+        state.revision = val;
+        state.page = 1;
+        syncUrlState();
+        renderRevisions(revs);
+        refreshList();
+      });
+      return b;
+    };
+    strip.appendChild(mk('전체 리비전', state.stats?.total_sheets || 0, !state.revision, ''));
+    for (const r of revs) {
+      strip.appendChild(mk(r.name, r.count, state.revision === r.name, r.name));
+    }
   }
 
   function renderCategories(cats) {
@@ -256,6 +345,7 @@
 
     try {
       if (state.tab === 'tags') {
+        $('revisionStrip').hidden = true;
         $('categoryStrip').hidden = true;
         $('subCategoryStrip').hidden = true;
         pager.hidden = true;
@@ -283,8 +373,10 @@
       }
 
       $('categoryStrip').hidden = false;
+      if ((state.stats?.revisions || []).length > 1) $('revisionStrip').hidden = false;
       const params = new URLSearchParams({
         q: state.q,
+        revision: state.revision,
         category: state.category,
         subcategory: state.subcategory,
         favorites_only: state.tab === 'favorites' ? 'true' : 'false',
@@ -308,8 +400,9 @@
         btn.className = 'sheet-row' + (state.sheet?.sheet_id === item.sheet_id ? ' active' : '');
         const pageTag = item.total_pages > 1 ? `p.${item.page_no}/${item.total_pages}` : '';
         const dwgLabel = item.drawing_no && item.drawing_no !== item.title ? `${item.drawing_no} · ` : '';
+        const snippetHtml = item.snippet ? `<div class="search-snippet">${renderSnippetHtml(item.snippet)}</div>` : '';
         btn.innerHTML = `
-          <img class="sheet-thumb" loading="lazy" decoding="async" src="/api/sheets/${encodeURIComponent(item.sheet_id)}/thumb.webp?v=${item.v}" alt="" />
+          <img class="sheet-thumb" width="58" height="42" loading="lazy" decoding="async" src="/api/sheets/${encodeURIComponent(item.sheet_id)}/thumb.webp?v=${item.v}" alt="" />
           <div class="sheet-info">
             <div class="sheet-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
             <div class="sheet-sub">
@@ -317,6 +410,7 @@
               <span>${escapeHtml(dwgLabel + pageTag)}</span>
               <span>태그 ${item.tag_count}</span>
             </div>
+            ${snippetHtml}
           </div>
         `;
         btn.addEventListener('click', () => {
@@ -337,14 +431,18 @@
     }
   }
 
-  // 9) 도면 열기 + 지연 타일 피라미드 + 오버레이
+  // 9) 도면 열기 + 지연 타일 피라미드 + 오버레이 + 현장 메모 핀 (경쟁 조건 방어 포함)
   async function openSheet(sheetId, focusTagName = null) {
+    const seq = ++state.openReqSeq;
     $('canvasLoading').hidden = false;
     try {
       const sheet = await api(`/api/drawings/${encodeURIComponent(sheetId)}`);
+      if (seq !== state.openReqSeq) return; // 더 최신 요청이 진행 중이면 구 응답 무시
       state.sheet = sheet;
       state.selectedTagId = null;
+      state.selectedTagName = focusTagName || '';
       state.loadedTiles.clear();
+      syncUrlState();
 
       // 헤더 갱신
       $('viewerHeader').hidden = false;
@@ -352,6 +450,7 @@
       $('stageLayer').hidden = false;
       $('zoomControls').hidden = false;
       $('docCatBadge').textContent = sheet.category;
+      $('shxBadge').hidden = !(sheet.extra_categories || '').includes('SHX');
       $('docTitle').textContent = sheet.title;
       $('docSub').textContent = sheet.total_pages > 1
         ? `${sheet.subcategory} · ${sheet.page_no}/${sheet.total_pages}p`
@@ -369,16 +468,24 @@
         pdfBtn.hidden = true;
       }
 
-      // 형제 페이지 네비게이션 (다중 페이지 P&ID 등)
+      // 형제 페이지 네비게이션 + 페이지 번호 즉시 점프
       const sibNav = $('siblingNav');
       if (sheet.siblings && sheet.siblings.length > 1) {
         const idx = sheet.siblings.findIndex((s) => s.sheet_id === sheet.sheet_id);
         sibNav.hidden = false;
-        $('siblingLabel').textContent = `${idx + 1} / ${sheet.siblings.length}`;
+        const jumpInp = $('siblingJump');
+        jumpInp.max = String(sheet.siblings.length);
+        jumpInp.value = String(idx + 1);
+        $('siblingLabel').textContent = `/ ${sheet.siblings.length}`;
         $('btnSibPrev').disabled = idx <= 0;
         $('btnSibNext').disabled = idx >= sheet.siblings.length - 1;
         $('btnSibPrev').onclick = () => idx > 0 && openSheet(sheet.siblings[idx - 1].sheet_id);
         $('btnSibNext').onclick = () => idx < sheet.siblings.length - 1 && openSheet(sheet.siblings[idx + 1].sheet_id);
+        jumpInp.onchange = () => {
+          const n = Math.max(1, Math.min(sheet.siblings.length, parseInt(jumpInp.value, 10) || 1));
+          jumpInp.value = String(n);
+          if (n - 1 !== idx) openSheet(sheet.siblings[n - 1].sheet_id);
+        };
       } else {
         sibNav.hidden = true;
       }
@@ -393,6 +500,7 @@
       $('tileGrid').innerHTML = '';
       const img = $('previewImg');
       img.onload = () => {
+        if (seq !== state.openReqSeq) return;
         $('canvasLoading').hidden = true;
         if (focusTagName) {
           const hit = sheet.tags.find((t) => t.tag.toUpperCase() === focusTagName.toUpperCase());
@@ -404,20 +512,87 @@
         fitToViewport();
       };
       img.onerror = () => {
+        if (seq !== state.openReqSeq) return;
         $('canvasLoading').hidden = true;
         showToast('도면 이미지 로드에 실패했습니다');
       };
       img.src = `/api/sheets/${encodeURIComponent(sheet.sheet_id)}/preview.webp?v=${sheet.v}`;
 
       renderOverlayBoxes(sheet.tags);
+      renderPins(sheet.pins || []);
       renderInspector(sheet.tags);
 
-      // 활성 행 강조
       document.querySelectorAll('.sheet-row').forEach((el) => el.classList.remove('active'));
     } catch (err) {
+      if (seq !== state.openReqSeq) return;
       $('canvasLoading').hidden = true;
       if (err.message !== 'AUTH_401') showToast(`도면 열기 실패: ${err.message}`);
     }
+  }
+
+  function renderPins(pins) {
+    const layer = $('pinLayer');
+    const box = $('pinListBox');
+    layer.innerHTML = '';
+    if (!pins || !pins.length) {
+      box.hidden = true;
+      box.innerHTML = '';
+      return;
+    }
+    box.hidden = false;
+    box.innerHTML = `<div class="cross-ref-title">현장 메모 핀 (${pins.length})</div>`;
+    pins.forEach((p, i) => {
+      const mk = document.createElement('button');
+      mk.type = 'button';
+      mk.className = 'pin-marker';
+      mk.textContent = String(i + 1);
+      mk.title = `${p.note} (${p.username})`;
+      mk.style.left = `${p.x * 100}%`;
+      mk.style.top = `${p.y * 100}%`;
+      mk.addEventListener('click', (e) => {
+        e.stopPropagation();
+        $('inspector').hidden = false;
+        zoomToNormalized(p.x, p.y);
+      });
+      layer.appendChild(mk);
+
+      const canDel = state.user?.is_admin || state.user?.username === p.username;
+      const row = document.createElement('div');
+      row.className = 'pin-item';
+      row.innerHTML = `
+        <div class="pin-item-body">
+          <div class="pin-item-note"><strong>#${i + 1}</strong> ${escapeHtml(p.note)}</div>
+          <div class="pin-item-meta">${escapeHtml(p.username)} · ${escapeHtml(p.created_at)}</div>
+        </div>
+        ${canDel ? '<button type="button" class="icon-btn-sm" aria-label="핀 삭제" title="삭제">×</button>' : ''}
+      `;
+      row.querySelector('.pin-item-body').addEventListener('click', () => zoomToNormalized(p.x, p.y));
+      if (canDel) {
+        row.querySelector('button').addEventListener('click', async () => {
+          try {
+            await api(`/api/pins/${p.id}`, { method: 'DELETE' });
+            state.sheet.pins = (state.sheet.pins || []).filter((x) => x.id !== p.id);
+            renderPins(state.sheet.pins);
+            showToast('메모 핀을 삭제했습니다');
+          } catch (err) {
+            if (err.message !== 'AUTH_401') showToast(`삭제 실패: ${err.message}`);
+          }
+        });
+      }
+      box.appendChild(row);
+    });
+  }
+
+  function zoomToNormalized(nx, ny) {
+    const vp = $('canvasViewport').getBoundingClientRect();
+    const cx = nx * state.baseW;
+    const cy = ny * state.baseH;
+    const fitScale = Math.min(vp.width / state.baseW, vp.height / state.baseH);
+    const targetScale = Math.min(Math.max(fitScale * 3.0, 0.85), 3.0);
+    state.scale = targetScale;
+    state.tx = vp.width / 2 - cx * targetScale;
+    state.ty = vp.height / 2 - cy * targetScale;
+    applyTransform();
   }
 
   function renderOverlayBoxes(tags) {
@@ -468,6 +643,8 @@
 
   async function focusTag(tagObj) {
     state.selectedTagId = tagObj.id;
+    state.selectedTagName = tagObj.tag || '';
+    syncUrlState();
     document.querySelectorAll('.tag-box').forEach((el) => {
       el.classList.toggle('selected', el.dataset.tagId === String(tagObj.id));
     });
@@ -632,13 +809,15 @@
     });
 
     vp.addEventListener('pointerdown', (e) => {
-      if (!state.sheet || e.target.closest('.zoom-controls')) return;
+      if (!state.sheet || e.target.closest('.zoom-controls, .pin-marker, .tag-box')) return;
       vp.setPointerCapture(e.pointerId);
       state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      state.pointerMoved = false;
       if (state.pointers.size === 1) {
         state.dragStart = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
         vp.classList.add('dragging');
       } else if (state.pointers.size === 2) {
+        state.pointerMoved = true;
         const [a, b] = [...state.pointers.values()];
         state.pinchStartDist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
         state.pinchStartScale = state.scale;
@@ -650,8 +829,11 @@
       if (!state.pointers.has(e.pointerId)) return;
       state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (state.pointers.size === 1 && state.dragStart) {
-        state.tx = state.dragStart.tx + (e.clientX - state.dragStart.x);
-        state.ty = state.dragStart.ty + (e.clientY - state.dragStart.y);
+        const dx = e.clientX - state.dragStart.x;
+        const dy = e.clientY - state.dragStart.y;
+        if (Math.hypot(dx, dy) > 6) state.pointerMoved = true;
+        state.tx = state.dragStart.tx + dx;
+        state.ty = state.dragStart.ty + dy;
         applyTransform();
       } else if (state.pointers.size === 2 && state.pinchCenter) {
         const [a, b] = [...state.pointers.values()];
@@ -662,11 +844,23 @@
     });
 
     const endPtr = (e) => {
+      const wasSingleClick = state.pointers.size === 1 && !state.pointerMoved && state.pinMode && state.sheet;
       state.pointers.delete(e.pointerId);
       if (state.pointers.size < 2) state.pinchCenter = null;
       if (state.pointers.size === 0) {
         state.dragStart = null;
         vp.classList.remove('dragging');
+      }
+      if (wasSingleClick && e.type === 'pointerup') {
+        const r = vp.getBoundingClientRect();
+        const nx = (e.clientX - r.left - state.tx) / (state.scale * state.baseW);
+        const ny = (e.clientY - r.top - state.ty) / (state.scale * state.baseH);
+        if (nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1) {
+          state.pendingPin = { x: nx, y: ny };
+          $('pinNoteInput').value = '';
+          $('pinDialog').showModal();
+          $('pinNoteInput').focus();
+        }
       }
     };
     vp.addEventListener('pointerup', endPtr);
@@ -724,9 +918,7 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '로그인 실패');
-        state.token = data.token;
         state.user = { username: data.username, role: data.role, is_admin: data.role === 'admin' };
-        localStorage.setItem(TOKEN_KEY, data.token);
         localStorage.setItem(USER_KEY, JSON.stringify(state.user));
         $('loginPass').value = '';
         enterApp();
@@ -778,6 +970,7 @@
       searchDebounce = setTimeout(() => {
         state.q = input.value.trim();
         state.page = 1;
+        syncUrlState();
         refreshList();
       }, 220);
     });
@@ -785,6 +978,7 @@
       e.preventDefault();
       state.q = input.value.trim();
       state.page = 1;
+      syncUrlState();
       refreshList();
     });
     $('btnClearSearch').addEventListener('click', () => {
@@ -792,6 +986,7 @@
       $('btnClearSearch').hidden = true;
       state.q = '';
       state.page = 1;
+      syncUrlState();
       refreshList();
     });
 
@@ -819,6 +1014,48 @@
       $('btnInvertColors').classList.toggle('active', on);
     });
 
+    $('btnCopyLink').addEventListener('click', async () => {
+      if (!state.sheet) return;
+      syncUrlState();
+      try {
+        await navigator.clipboard.writeText(location.href);
+        showToast('도면 공유 링크를 복사했습니다');
+      } catch (_) {
+        showToast(location.href);
+      }
+    });
+
+    $('btnPinMode').addEventListener('click', () => {
+      state.pinMode = !state.pinMode;
+      $('btnPinMode').classList.toggle('active', state.pinMode);
+      $('canvasViewport').classList.toggle('pin-mode', state.pinMode);
+      showToast(state.pinMode ? '메모 핀 모드: 도면 위 원하는 위치를 클릭하세요' : '메모 핀 모드를 종료했습니다');
+    });
+
+    $('pinForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!state.sheet || !state.pendingPin) return;
+      const note = $('pinNoteInput').value.trim();
+      if (!note) return;
+      try {
+        const created = await api(`/api/sheets/${encodeURIComponent(state.sheet.sheet_id)}/pins`, {
+          method: 'POST',
+          body: JSON.stringify({ x: state.pendingPin.x, y: state.pendingPin.y, note }),
+        });
+        state.sheet.pins = [...(state.sheet.pins || []), created];
+        renderPins(state.sheet.pins);
+        $('inspector').hidden = false;
+        $('pinDialog').close();
+        state.pendingPin = null;
+        state.pinMode = false;
+        $('btnPinMode').classList.remove('active');
+        $('canvasViewport').classList.remove('pin-mode');
+        showToast('현장 메모 핀을 저장했습니다');
+      } catch (err) {
+        if (err.message !== 'AUTH_401') showToast(`핀 저장 실패: ${err.message}`);
+      }
+    });
+
     $('btnFavorite').addEventListener('click', async () => {
       if (!state.sheet) return;
       try {
@@ -841,6 +1078,73 @@
       if (state.sheet) renderInspector(state.sheet.tags, e.target.value);
     });
 
+    async function loadAdminUsers() {
+      const sec = $('adminUsersSection');
+      if (!state.user?.is_admin) {
+        sec.hidden = true;
+        return;
+      }
+      sec.hidden = false;
+      sec.innerHTML = '<h2>팀원 계정 관리</h2><p>불러오는 중…</p>';
+      try {
+        const data = await api('/api/admin/users');
+        const rowsHtml = data.items.map((u) => {
+          const isSelf = u.username === state.user.username;
+          return `
+            <div class="admin-user-row">
+              <span><strong>${escapeHtml(u.username)}</strong> (${escapeHtml(u.role)})</span>
+              ${isSelf ? '<span class="tag-meta">현재 관리자</span>' : `<button type="button" class="btn btn-ghost btn-sm" data-del-user="${escapeHtml(u.username)}">삭제</button>`}
+            </div>
+          `;
+        }).join('');
+        sec.innerHTML = `
+          <h2>팀원 계정 관리 (${data.items.length})</h2>
+          <div>${rowsHtml}</div>
+          <form id="addUserForm" class="admin-user-form">
+            <input id="newUserName" type="text" required placeholder="새 아이디" autocomplete="off" />
+            <input id="newUserPass" type="password" required minlength="4" placeholder="비밀번호 (4자+)" autocomplete="new-password" />
+            <select id="newUserRole" aria-label="권한">
+              <option value="engineer">엔지니어</option>
+              <option value="admin">관리자</option>
+            </select>
+            <button type="submit" class="btn btn-primary btn-sm">추가</button>
+          </form>
+        `;
+        sec.querySelectorAll('[data-del-user]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const target = btn.dataset.delUser;
+            if (!confirm(`계정 "${target}"을(를) 삭제하시겠습니까?`)) return;
+            try {
+              await api(`/api/admin/users/${encodeURIComponent(target)}`, { method: 'DELETE' });
+              showToast(`계정 ${target} 삭제 완료`);
+              loadAdminUsers();
+            } catch (err) {
+              if (err.message !== 'AUTH_401') showToast(`삭제 실패: ${err.message}`);
+            }
+          });
+        });
+        $('addUserForm').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          try {
+            await api('/api/admin/users', {
+              method: 'POST',
+              body: JSON.stringify({
+                username: $('newUserName').value.trim(),
+                password: $('newUserPass').value,
+                role: $('newUserRole').value,
+              }),
+            });
+            showToast('새 계정을 등록했습니다');
+            loadAdminUsers();
+          } catch (err) {
+            if (err.message !== 'AUTH_401') showToast(`등록 실패: ${err.message}`);
+          }
+        });
+      } catch (err) {
+        sec.innerHTML = `<p class="form-error">${escapeHtml(err.message)}</p>`;
+      }
+    }
+
     $('btnAccount').addEventListener('click', () => {
       const m = state.stats?.meta || {};
       $('accountBody').innerHTML = `
@@ -850,6 +1154,7 @@
         <p><strong>총 도면 / 고유 태그</strong>: ${state.stats?.total_sheets || 0}장 / ${state.stats?.unique_tags || 0}종</p>
       `;
       $('accountDialog').showModal();
+      loadAdminUsers();
     });
 
     $('btnLogout').addEventListener('click', async () => {

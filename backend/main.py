@@ -8,8 +8,11 @@ import re
 import shutil
 import sqlite3
 import tarfile
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -37,6 +40,7 @@ from backend.db import (
     create_session,
     delete_session,
     drawings_conn,
+    ensure_drawings_migrations,
     get_session,
     hash_password,
     init_drawings_db,
@@ -48,17 +52,73 @@ from backend.db import (
 
 SESSION_COOKIE = "dsv_session"
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+MAX_SYNC_UPLOAD_BYTES = 64 * 1024 * 1024     # 단일 청크 최대 64MB
+MAX_SYNC_EXTRACT_BYTES = 192 * 1024 * 1024   # 압축 해제 누적 최대 192MB (Tar Bomb 방어)
+LOGIN_RATE_LIMIT_MAX = 10
+LOGIN_RATE_LIMIT_WINDOW_S = 900              # 15분당 IP별 실패 10회 상한
+_login_fail_lock = threading.Lock()
+_login_fails: dict[str, deque[float]] = {}
+
+
+def _check_login_rate_limit(ip: str) -> bool:
+    """허용 시 True, 차단 시 False."""
+    now = time.monotonic()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_S
+    with _login_fail_lock:
+        q = _login_fails.get(ip)
+        if not q:
+            return True
+        while q and q[0] < cutoff:
+            q.popleft()
+        if not q:
+            _login_fails.pop(ip, None)
+            return True
+        return len(q) < LOGIN_RATE_LIMIT_MAX
+
+
+def _record_login_failure(ip: str) -> None:
+    now = time.monotonic()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_S
+    with _login_fail_lock:
+        q = _login_fails.setdefault(ip, deque())
+        while q and q[0] < cutoff:
+            q.popleft()
+        q.append(now)
+
+
+def _clear_login_failures(ip: str) -> None:
+    with _login_fail_lock:
+        _login_fails.pop(ip, None)
+
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     init_state_db()
     if not get_db_path().is_file():
         init_drawings_db()
+    else:
+        with drawings_conn() as conn:
+            ensure_drawings_migrations(conn)
+            conn.commit()
     yield
 
 
-app = FastAPI(title="도면 스마트 뷰어", version="1.1.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="도면 스마트 뷰어", version="1.2.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+    )
+    return resp
 
 
 def _client_ip(request: Request) -> str:
@@ -160,14 +220,20 @@ def login(body: LoginBody, request: Request, response: Response) -> dict[str, An
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")
     username = body.username.strip()
+    if not _check_login_rate_limit(ip):
+        record_audit(username, "login_rate_limited", ip=ip, user_agent=ua)
+        raise HTTPException(status_code=429, detail="로그인 시도가 너무 많습니다. 15분 후 다시 시도해 주세요")
+
     with state_conn() as conn:
         row = conn.execute(
             "SELECT username, password_hash, role FROM users WHERE username = ?", (username,)
         ).fetchone()
     if row is None or not verify_password(body.password, row["password_hash"]):
+        _record_login_failure(ip)
         record_audit(username, "login_failed", ip=ip, user_agent=ua)
         raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 일치하지 않습니다")
 
+    _clear_login_failures(ip)
     token = create_session(row["username"], row["role"], ip, ua)
     record_audit(row["username"], "login_success", ip=ip, user_agent=ua)
     is_https = (
@@ -228,6 +294,10 @@ def get_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
             "SELECT category, subcategory, COUNT(*) AS cnt, SUM(tag_count) AS tags "
             "FROM sheets GROUP BY category, subcategory ORDER BY category, subcategory"
         ).fetchall()
+        revs = conn.execute(
+            "SELECT revision, COUNT(*) AS cnt FROM sheets "
+            "WHERE revision != '' GROUP BY revision ORDER BY revision DESC"
+        ).fetchall()
     with state_conn() as sconn:
         fav_cnt = sconn.execute(
             "SELECT COUNT(*) FROM favorites WHERE username = ?", (user["username"],)
@@ -250,12 +320,14 @@ def get_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
         "favorites_count": fav_cnt,
         "meta": meta,
         "categories": list(grouped.values()),
+        "revisions": [{"name": r["revision"], "count": r["cnt"]} for r in revs],
     }
 
 
 @app.get("/api/drawings")
 def list_drawings(
     q: str = Query(default="", max_length=120),
+    revision: str = Query(default="", max_length=120),
     category: str = Query(default="", max_length=80),
     subcategory: str = Query(default="", max_length=120),
     favorites_only: bool = Query(default=False),
@@ -274,6 +346,9 @@ def list_drawings(
     where: list[str] = []
     params: list[Any] = []
 
+    if revision:
+        where.append("s.revision = ?")
+        params.append(revision)
     if category:
         where.append("s.category = ?")
         params.append(category)
@@ -287,6 +362,7 @@ def list_drawings(
         where.append(f"s.sheet_id IN ({placeholders})")
         params.extend(sorted(fav_ids))
 
+    snippets_map: dict[str, str] = {}
     with drawings_conn() as conn:
         if q_clean:
             fts = _fts_query(q_clean)
@@ -304,7 +380,7 @@ def list_drawings(
                 ).fetchone()[0]
                 rows = conn.execute(
                     f"""
-                    SELECT s.sheet_id, s.category, s.subcategory, s.drawing_no, s.title,
+                    SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
                            s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
                            s.tag_count, s.has_pdf, s.has_preview, s.sha256
                     FROM sheets s
@@ -319,6 +395,16 @@ def list_drawings(
                     """,
                     [fts, like, like, *params, like, like, limit, offset],
                 ).fetchall()
+                if rows and fts:
+                    sids = [r["sheet_id"] for r in rows]
+                    ph = ",".join("?" for _ in sids)
+                    for sr in conn.execute(
+                        f"SELECT sheet_id, snippet(sheets_fts, 6, '[[H]]', '[[/H]]', '…', 14) AS snip "
+                        f"FROM sheets_fts WHERE sheets_fts MATCH ? AND sheet_id IN ({ph})",
+                        [fts, *sids],
+                    ).fetchall():
+                        if sr["snip"]:
+                            snippets_map[sr["sheet_id"]] = sr["snip"].replace("\r", " ").replace("\n", " ")
             except sqlite3.OperationalError:
                 total = conn.execute(
                     f"SELECT COUNT(*) FROM sheets s WHERE (s.title LIKE ? OR s.drawing_no LIKE ? OR s.full_text LIKE ?){where_sql}",
@@ -326,7 +412,7 @@ def list_drawings(
                 ).fetchone()[0]
                 rows = conn.execute(
                     f"""
-                    SELECT s.sheet_id, s.category, s.subcategory, s.drawing_no, s.title,
+                    SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
                            s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
                            s.tag_count, s.has_pdf, s.has_preview, s.sha256
                     FROM sheets s
@@ -341,7 +427,7 @@ def list_drawings(
             total = conn.execute(f"SELECT COUNT(*) FROM sheets s {where_sql}", params).fetchone()[0]
             rows = conn.execute(
                 f"""
-                SELECT s.sheet_id, s.category, s.subcategory, s.drawing_no, s.title,
+                SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
                        s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
                        s.tag_count, s.has_pdf, s.has_preview, s.sha256
                 FROM sheets s
@@ -357,6 +443,8 @@ def list_drawings(
         d = dict(r)
         d["is_favorite"] = d["sheet_id"] in fav_ids
         d["v"] = d["sha256"][:8]
+        if d["sheet_id"] in snippets_map:
+            d["snippet"] = snippets_map[d["sheet_id"]]
         items.append(d)
     return {"total": total, "page": page, "limit": limit, "items": items}
 
@@ -406,6 +494,14 @@ def get_drawing_detail(sheet_id: str, request: Request, user: dict[str, Any] = D
             "SELECT 1 FROM favorites WHERE username = ? AND sheet_id = ?",
             (user["username"], sheet_id),
         ).fetchone() is not None
+        pins = [
+            dict(r)
+            for r in sconn.execute(
+                "SELECT id, sheet_id, username, x, y, note, created_at "
+                "FROM sheet_pins WHERE sheet_id = ? ORDER BY id ASC",
+                (sheet_id,),
+            ).fetchall()
+        ]
 
     record_audit(user["username"], "view_sheet", target=sheet_id,
                  ip=_client_ip(request), user_agent=request.headers.get("user-agent", ""))
@@ -414,6 +510,7 @@ def get_drawing_detail(sheet_id: str, request: Request, user: dict[str, Any] = D
     sheet["is_favorite"] = fav
     sheet["tags"] = tags
     sheet["siblings"] = siblings
+    sheet["pins"] = pins
     return sheet
 
 
@@ -473,7 +570,7 @@ def tag_cross_references(tag_name: str, user: dict[str, Any] = Depends(require_u
                    s.sheet_id, s.category, s.subcategory, s.drawing_no, s.title, s.page_no, s.sha256
             FROM tags t
             JOIN sheets s ON s.sheet_id = t.sheet_id
-            WHERE UPPER(t.tag) = UPPER(?)
+            WHERE t.tag = ? COLLATE NOCASE
             ORDER BY s.category, s.title, s.page_no
             """,
             (tag_name.strip(),),
@@ -505,6 +602,73 @@ def toggle_favorite(sheet_id: str, user: dict[str, Any] = Depends(require_user))
             (user["username"], sheet_id, now_kst_iso()),
         )
         return {"sheet_id": sheet_id, "is_favorite": True}
+
+
+# ── 현장 점검 메모 핀 (app_state.db 영속 저장) ────────────────────────────────
+
+class PinCreateBody(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+    note: str = Field(min_length=1, max_length=300)
+
+
+@app.get("/api/sheets/{sheet_id}/pins")
+def list_sheet_pins(sheet_id: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    _validate_sheet_id(sheet_id)
+    with state_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, sheet_id, username, x, y, note, created_at "
+            "FROM sheet_pins WHERE sheet_id = ? ORDER BY id ASC",
+            (sheet_id,),
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/api/sheets/{sheet_id}/pins")
+def create_sheet_pin(
+    sheet_id: str,
+    body: PinCreateBody,
+    request: Request,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    _validate_sheet_id(sheet_id)
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="메모 내용을 입력해 주세요")
+    now = now_kst_iso()
+    with state_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO sheet_pins(sheet_id, username, x, y, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (sheet_id, user["username"], round(body.x, 5), round(body.y, 5), note, now),
+        )
+        pin_id = cur.lastrowid
+    record_audit(user["username"], "create_pin", target=sheet_id, ip=_client_ip(request), detail=note[:120])
+    return {
+        "id": pin_id,
+        "sheet_id": sheet_id,
+        "username": user["username"],
+        "x": round(body.x, 5),
+        "y": round(body.y, 5),
+        "note": note,
+        "created_at": now,
+    }
+
+
+@app.delete("/api/pins/{pin_id}")
+def delete_sheet_pin(
+    pin_id: int,
+    request: Request,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    with state_conn() as conn:
+        row = conn.execute("SELECT id, sheet_id, username FROM sheet_pins WHERE id = ?", (pin_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="메모 핀을 찾을 수 없습니다")
+        if row["username"] != user["username"] and user.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="본인이 작성한 메모 핀만 삭제할 수 있습니다")
+        conn.execute("DELETE FROM sheet_pins WHERE id = ?", (pin_id,))
+    record_audit(user["username"], "delete_pin", target=f"{row['sheet_id']}#{pin_id}", ip=_client_ip(request))
+    return {"status": "ok", "deleted_id": pin_id}
 
 
 # ── 도면 정적 리소스 서빙 (타일 · 프리뷰 · 썸네일 · 단일 페이지 PDF) ────────
@@ -582,12 +746,17 @@ async def upload_sync_bundle(
     allowed_roots = {"drawings.db", "tiles", "thumbs", "pdfs"}
     extracted = 0
 
-    raw = await bundle.read()
+    raw = await bundle.read(MAX_SYNC_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_SYNC_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="동기화 번들 크기가 64MB 상한을 초과했습니다")
+    extracted_bytes = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
             for member in tf.getmembers():
                 if not (member.isfile() or member.isdir()):
                     raise HTTPException(status_code=400, detail=f"허용되지 않는 아카이브 항목: {member.name}")
+                if member.size < 0 or extracted_bytes + member.size > MAX_SYNC_EXTRACT_BYTES:
+                    raise HTTPException(status_code=413, detail="아카이브 압축 해제 총량이 192MB 상한을 초과했습니다")
                 rel = Path(member.name)
                 if rel.is_absolute() or ".." in rel.parts or not rel.parts:
                     raise HTTPException(status_code=400, detail=f"경로 조작 차단: {member.name}")
@@ -610,15 +779,19 @@ async def upload_sync_bundle(
                     tmp_db = data_dir / ".drawings.db.incoming"
                     with open(tmp_db, "wb") as out:
                         shutil.copyfileobj(fobj, out)
-                    # 기존 WAL/SHM 정리 후 원자적 교체
+                    # 기존 WAL/SHM 정리 후 원자적 교체 + v1.2.0 인덱스 보장
                     for suffix in ("-wal", "-shm"):
                         (data_dir / f"drawings.db{suffix}").unlink(missing_ok=True)
                     tmp_db.replace(data_dir / "drawings.db")
+                    with drawings_conn() as dconn:
+                        ensure_drawings_migrations(dconn)
+                        dconn.commit()
                 else:
                     tmp_f = dest.with_name(f".{dest.name}.tmp")
                     with open(tmp_f, "wb") as out:
                         shutil.copyfileobj(fobj, out)
                     tmp_f.replace(dest)
+                extracted_bytes += member.size
                 extracted += 1
     except tarfile.TarError as exc:
         raise HTTPException(status_code=400, detail=f"손상된 tar.gz 번들: {exc}") from exc
@@ -753,7 +926,7 @@ def delete_user(username: str, request: Request,
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def serve_index() -> HTMLResponse:
     html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
     return HTMLResponse(content=html, headers={"Cache-Control": "no-cache"})
