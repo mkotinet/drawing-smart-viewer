@@ -49,6 +49,7 @@ SYNC_TOKEN = os.environ.get("SYNC_TOKEN", "").strip()
 WORKER_PORT = int(os.environ.get("WORKER_PORT", "8099"))
 BATCH_COMMIT = max(1, int(os.environ.get("BATCH_COMMIT", "20")))
 SHEET_SLEEP = max(0.0, float(os.environ.get("SHEET_SLEEP", "0.15")))
+ENABLE_OCR = os.environ.get("ENABLE_OCR", "true").strip().lower() not in {"0", "false", "no", "off"}
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 VIEWER_PUBLIC_URL = os.environ.get("VIEWER_PUBLIC_URL", "").strip()
 
@@ -245,6 +246,8 @@ def run_sync_cycle(reason: str = "scheduled", force_notify: bool = False) -> dic
             project_name=PROJECT_NAME,
             batch_commit=BATCH_COMMIT,
             sheet_sleep=SHEET_SLEEP,
+            enable_ocr=ENABLE_OCR,
+            ocr_subprocess=True,
             progress_cb=on_progress,
         )
         summary.update(rclone_info)

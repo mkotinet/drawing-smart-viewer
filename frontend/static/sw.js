@@ -1,15 +1,15 @@
 /**
- * 도면 스마트 뷰어 — PWA Service Worker (v1.2.0)
+ * 도면 스마트 뷰어 — PWA Service Worker (v1.3.0)
  * 앱 쉘: Network-First / 불변 도면 타일·썸네일: Cache-First (현장 음영지역 오프라인 열람 지원)
  */
-const SHELL_CACHE = 'dsv-shell-v1.2.0';
+const SHELL_CACHE = 'dsv-shell-v1.3.0';
 const TILE_CACHE = 'dsv-tiles-v1.0.0';
 const MAX_TILE_ENTRIES = 260;
 
 const PRECACHE_URLS = [
   '/',
-  '/static/style.css?v=1.2.0',
-  '/static/app.js?v=1.2.0',
+  '/static/style.css?v=1.3.0',
+  '/static/app.js?v=1.3.0',
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png',
   '/static/icons/apple-touch-icon.png',

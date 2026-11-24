@@ -1,5 +1,6 @@
 # 절대 커밋 금지: 실제 도면, 인덱스 DB, 렌더 타일, 시크릿
 raw_drawings/
+raw_drawings_all/
 data/
 dist/
 *.pdf

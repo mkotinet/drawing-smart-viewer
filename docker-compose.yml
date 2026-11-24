@@ -37,8 +37,8 @@ services:
     image: drawing-sync-worker:latest
     container_name: ${WORKER_CONTAINER_NAME:-drawing-sync-worker}
     restart: unless-stopped
-    mem_limit: 512m
-    memswap_limit: 1024m
+    mem_limit: 768m
+    memswap_limit: 1536m
     cpu_shares: 256
     oom_score_adj: 700
     environment:
@@ -50,6 +50,7 @@ services:
       - RCLONE_CONF_B64=${RCLONE_CONF_B64}
       - PROJECT_NAME=${PROJECT_NAME:-도면 프로젝트}
       - SYNC_INTERVAL_MIN=${SYNC_INTERVAL_MIN:-15}
+      - ENABLE_OCR=${ENABLE_OCR:-true}
       - SYNC_TOKEN=${SYNC_TOKEN}
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - VIEWER_PUBLIC_URL=${VIEWER_PUBLIC_URL:-}

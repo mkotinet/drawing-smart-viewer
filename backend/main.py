@@ -37,6 +37,7 @@ from backend.config import (
     now_kst_iso,
 )
 from backend.db import (
+    canonicalize_tag,
     create_session,
     delete_session,
     drawings_conn,
@@ -103,7 +104,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="도면 스마트 뷰어", version="1.2.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="도면 스마트 뷰어", version="1.3.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -161,6 +162,70 @@ def _fts_query(raw: str) -> str:
     if not tokens:
         return ""
     return " AND ".join(f'"{t}"*' for t in tokens)
+
+
+def _trigram_query(raw: str) -> str:
+    tokens = [re.sub(r'["\'\*\(\):^]', "", tok).strip() for tok in raw.split()]
+    tokens = [t for t in tokens if len(t) >= 3]
+    if not tokens:
+        return ""
+    return " AND ".join(f'"{t}"' for t in tokens)
+
+
+def _build_fallback_snippet(text: str, query: str, radius: int = 44) -> str:
+    """FTS5 trigram · 정규화 태그 매칭 결과용 하이라이트([[H]]...[[/H]]) 문맥 스니펫 생성."""
+    if not text or not query:
+        return ""
+    flat = re.sub(r"\s+", " ", text).strip()
+    if not flat:
+        return ""
+    needles = [t for t in query.split() if len(t) >= 2]
+    upper_flat = flat.upper()
+    pos = -1
+    hit_len = 0
+    for nd in needles:
+        p = upper_flat.find(nd.upper())
+        if p >= 0:
+            pos, hit_len = p, len(nd)
+            break
+    if pos < 0:
+        canon = canonicalize_tag(query)
+        if len(canon) >= 3:
+            # 원문 토큰에서 구분자 무시 매칭 탐색
+            for m in re.finditer(r"[A-Za-z0-9_\"/-]{3,36}", flat):
+                if canon in canonicalize_tag(m.group(0)):
+                    pos, hit_len = m.start(), m.end() - m.start()
+                    break
+    if pos < 0:
+        return ""
+    s0 = max(0, pos - radius)
+    s1 = min(len(flat), pos + hit_len + radius)
+    prefix = "…" if s0 > 0 else ""
+    suffix = "…" if s1 < len(flat) else ""
+    return f"{prefix}{flat[s0:pos]}[[H]]{flat[pos:pos + hit_len]}[[/H]]{flat[pos + hit_len:s1]}{suffix}"
+
+
+def _discipline_rank(category: str, subcategory: str) -> tuple[int, int]:
+    """엔지니어링 도면 추적 순서: P&ID → 제어 도면(HCD→WRP→EQP→MCW) → 전력제어 → SHOP → 기타."""
+    cat = (category or "").upper()
+    sub = (subcategory or "").upper()
+    if "P&ID" in cat or "PID" in cat:
+        return (0, 0)
+    if "제어" in category and "전력" not in category:
+        if "HCD" in sub or "계기 결선" in sub:
+            return (1, 0)
+        if "WRP" in sub or "배선" in sub:
+            return (1, 1)
+        if "EQP" in sub or "배치" in sub:
+            return (1, 2)
+        if "MCW" in sub or "주전원" in sub:
+            return (1, 3)
+        return (1, 4)
+    if "전력" in category:
+        return (2, 0 if "SYS" in sub else 1)
+    if "SHOP" in cat:
+        return (3, 0)
+    return (4, 0)
 
 
 # ── PWA 루트 & 헬스체크 ─────────────────────────────────────────────────────
@@ -287,7 +352,9 @@ def get_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     with drawings_conn() as conn:
         total_sheets = conn.execute("SELECT COUNT(*) FROM sheets").fetchone()[0]
         total_tags = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-        unique_tags = conn.execute("SELECT COUNT(DISTINCT tag) FROM tags").fetchone()[0]
+        unique_tags = conn.execute(
+            "SELECT COUNT(DISTINCT CASE WHEN canonical_tag != '' THEN canonical_tag ELSE UPPER(tag) END) FROM tags"
+        ).fetchone()[0]
         meta_rows = conn.execute("SELECT key, value FROM meta").fetchall()
         meta = {r["key"]: r["value"] for r in meta_rows}
         cats = conn.execute(
@@ -298,6 +365,16 @@ def get_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
             "SELECT revision, COUNT(*) AS cnt FROM sheets "
             "WHERE revision != '' GROUP BY revision ORDER BY revision DESC"
         ).fetchall()
+        kind_rows = conn.execute(
+            "SELECT kind, COUNT(DISTINCT CASE WHEN canonical_tag != '' THEN canonical_tag ELSE UPPER(tag) END) AS cnt "
+            "FROM tags GROUP BY kind"
+        ).fetchall()
+        kind_counts = {r["kind"]: r["cnt"] for r in kind_rows}
+        ocr_sheets = conn.execute("SELECT COUNT(*) FROM sheets WHERE ocr_status = 'ocr_done'").fetchone()[0]
+        try:
+            cont_count = conn.execute("SELECT COUNT(*) FROM continuations").fetchone()[0]
+        except sqlite3.Error:
+            cont_count = 0
     with state_conn() as sconn:
         fav_cnt = sconn.execute(
             "SELECT COUNT(*) FROM favorites WHERE username = ?", (user["username"],)
@@ -317,6 +394,9 @@ def get_stats(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
         "total_sheets": total_sheets,
         "total_tags": total_tags,
         "unique_tags": unique_tags,
+        "kind_counts": kind_counts,
+        "continuations_count": cont_count,
+        "ocr_sheets": ocr_sheets,
         "favorites_count": fav_cnt,
         "meta": meta,
         "categories": list(grouped.values()),
@@ -366,70 +446,133 @@ def list_drawings(
     with drawings_conn() as conn:
         if q_clean:
             fts = _fts_query(q_clean)
+            tri = _trigram_query(q_clean)
+            canon_q = canonicalize_tag(q_clean)
             like = f"%{q_clean}%"
             where_sql = (" AND " + " AND ".join(where)) if where else ""
-            try:
-                total = conn.execute(
-                    f"""
-                    SELECT COUNT(*) FROM sheets s
-                    WHERE (s.sheet_id IN (SELECT sheet_id FROM sheets_fts WHERE sheets_fts MATCH ?)
-                           OR s.title LIKE ? OR s.drawing_no LIKE ?)
-                    {where_sql}
-                    """,
-                    [fts, like, like, *params],
-                ).fetchone()[0]
-                rows = conn.execute(
-                    f"""
-                    SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
-                           s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
-                           s.tag_count, s.has_pdf, s.has_preview, s.sha256
-                    FROM sheets s
-                    WHERE (s.sheet_id IN (SELECT sheet_id FROM sheets_fts WHERE sheets_fts MATCH ?)
-                           OR s.title LIKE ? OR s.drawing_no LIKE ?)
-                    {where_sql}
-                    ORDER BY
-                        CASE WHEN UPPER(COALESCE(s.drawing_no, '')) LIKE UPPER(?) THEN 0
-                             WHEN UPPER(s.title) LIKE UPPER(?) THEN 1 ELSE 2 END,
-                        s.category, s.title, s.page_no
-                    LIMIT ? OFFSET ?
-                    """,
-                    [fts, like, like, *params, like, like, limit, offset],
-                ).fetchall()
-                if rows and fts:
-                    sids = [r["sheet_id"] for r in rows]
-                    ph = ",".join("?" for _ in sids)
-                    for sr in conn.execute(
-                        f"SELECT sheet_id, snippet(sheets_fts, 6, '[[H]]', '[[/H]]', '…', 14) AS snip "
-                        f"FROM sheets_fts WHERE sheets_fts MATCH ? AND sheet_id IN ({ph})",
-                        [fts, *sids],
+
+            # 1) 초고속 하이브리드 후보 시트 집합 수집 (FTS5 + Trigram 부분검색 + 정규화 태그 + 표제란)
+            matched_ids: set[str] = set()
+            exact_tag_ids: set[str] = set()
+
+            if fts:
+                try:
+                    for r in conn.execute("SELECT sheet_id FROM sheets_fts WHERE sheets_fts MATCH ?", (fts,)).fetchall():
+                        matched_ids.add(r[0])
+                except sqlite3.OperationalError:
+                    pass
+
+            # FTS5 trigram 부분 문자열 매칭 (61213, AHU0301, 무기통합, 구분자 무시 정규화 코드 등 < 5ms)
+            has_trigram = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sheets_trigram'"
+            ).fetchone() is not None
+            if has_trigram:
+                tri_queries: list[str] = []
+                if tri:
+                    tri_queries.append(tri)
+                if len(canon_q) >= 3 and f'"{canon_q}"' != tri:
+                    tri_queries.append(f'"{canon_q}"')
+                for tq in tri_queries:
+                    try:
+                        for r in conn.execute(
+                            "SELECT sheet_id FROM sheets_trigram WHERE sheets_trigram MATCH ?", (tq,)
+                        ).fetchall():
+                            matched_ids.add(r[0])
+                    except sqlite3.OperationalError:
+                        pass
+
+            # 정규화 태그 / 루프 키 매칭 (TCV-N2USCW31 ↔ TCV_N2USCW31, N2USCW31, 061213)
+            if len(canon_q) >= 2:
+                for r in conn.execute(
+                    "SELECT DISTINCT sheet_id FROM tags WHERE canonical_tag = ?", (canon_q,)
+                ).fetchall():
+                    exact_tag_ids.add(r[0])
+                    matched_ids.add(r[0])
+                if len(canon_q) >= 3:
+                    clike = f"%{canon_q}%"
+                    for r in conn.execute(
+                        "SELECT DISTINCT sheet_id FROM tags WHERE canonical_tag LIKE ? OR loop_key LIKE ?",
+                        (clike, like.upper()),
                     ).fetchall():
-                        if sr["snip"]:
-                            snippets_map[sr["sheet_id"]] = sr["snip"].replace("\r", " ").replace("\n", " ")
-            except sqlite3.OperationalError:
-                total = conn.execute(
-                    f"SELECT COUNT(*) FROM sheets s WHERE (s.title LIKE ? OR s.drawing_no LIKE ? OR s.full_text LIKE ?){where_sql}",
-                    [like, like, like, *params],
-                ).fetchone()[0]
-                rows = conn.execute(
-                    f"""
-                    SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
-                           s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
-                           s.tag_count, s.has_pdf, s.has_preview, s.sha256
-                    FROM sheets s
-                    WHERE (s.title LIKE ? OR s.drawing_no LIKE ? OR s.full_text LIKE ?){where_sql}
-                    ORDER BY s.category, s.title, s.page_no
-                    LIMIT ? OFFSET ?
-                    """,
-                    [like, like, like, *params, limit, offset],
-                ).fetchall()
+                        matched_ids.add(r[0])
+
+            # 제목·도면번호·도면ID 직접 매칭
+            for r in conn.execute(
+                "SELECT sheet_id FROM sheets WHERE title LIKE ? OR drawing_no LIKE ? OR drawing_id LIKE ?",
+                (like, like, like),
+            ).fetchall():
+                matched_ids.add(r[0])
+
+            if not matched_ids:
+                return {"total": 0, "page": page, "limit": limit, "items": []}
+
+            id_list = sorted(matched_ids)
+            ph = ",".join("?" for _ in id_list)
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM sheets s WHERE s.sheet_id IN ({ph}){where_sql}",
+                [*id_list, *params],
+            ).fetchone()[0]
+
+            exact_ph = ",".join("?" for _ in exact_tag_ids) if exact_tag_ids else ""
+            exact_case = f"WHEN s.sheet_id IN ({exact_ph}) THEN 1" if exact_tag_ids else ""
+            rank_params: list[Any] = [like, like]
+            if exact_tag_ids:
+                rank_params.extend(sorted(exact_tag_ids))
+            rank_params.append(like)
+
+            rows = conn.execute(
+                f"""
+                SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.drawing_id, s.title,
+                       s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
+                       s.tag_count, s.has_pdf, s.has_preview, s.sha256, s.ocr_status
+                FROM sheets s
+                WHERE s.sheet_id IN ({ph})
+                {where_sql}
+                ORDER BY
+                    CASE WHEN UPPER(COALESCE(s.drawing_no, '')) LIKE UPPER(?) OR UPPER(COALESCE(s.drawing_id, '')) LIKE UPPER(?) THEN 0
+                         {exact_case}
+                         WHEN UPPER(s.title) LIKE UPPER(?) THEN 2 ELSE 3 END,
+                    s.category, s.title, s.page_no
+                LIMIT ? OFFSET ?
+                """,
+                [*id_list, *params, *rank_params, limit, offset],
+            ).fetchall()
+
+            if rows:
+                page_sids = [r["sheet_id"] for r in rows]
+                p_ph = ",".join("?" for _ in page_sids)
+                if fts:
+                    try:
+                        for sr in conn.execute(
+                            f"SELECT sheet_id, snippet(sheets_fts, 6, '[[H]]', '[[/H]]', '…', 14) AS snip "
+                            f"FROM sheets_fts WHERE sheets_fts MATCH ? AND sheet_id IN ({p_ph})",
+                            [fts, *page_sids],
+                        ).fetchall():
+                            if sr["snip"]:
+                                snippets_map[sr["sheet_id"]] = sr["snip"].replace("\r", " ").replace("\n", " ")
+                    except sqlite3.OperationalError:
+                        pass
+                # FTS5 스니펫이 비어 있는 부분문자열(trigram)·태그 매칭 행은 직접 문맥 스니펫 생성
+                missing = [sid for sid in page_sids if sid not in snippets_map]
+                if missing:
+                    m_ph = ",".join("?" for _ in missing)
+                    for fr in conn.execute(
+                        f"SELECT sheet_id, tags_joined, full_text FROM sheets_fts WHERE sheet_id IN ({m_ph})",
+                        missing,
+                    ).fetchall():
+                        sn = _build_fallback_snippet(fr["tags_joined"] or "", q_clean) or _build_fallback_snippet(
+                            fr["full_text"] or "", q_clean
+                        )
+                        if sn:
+                            snippets_map[fr["sheet_id"]] = sn
         else:
             where_sql = ("WHERE " + " AND ".join(where)) if where else ""
             total = conn.execute(f"SELECT COUNT(*) FROM sheets s {where_sql}", params).fetchone()[0]
             rows = conn.execute(
                 f"""
-                SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title,
+                SELECT s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.drawing_id, s.title,
                        s.file_type, s.page_no, s.total_pages, s.width_px, s.height_px,
-                       s.tag_count, s.has_pdf, s.has_preview, s.sha256
+                       s.tag_count, s.has_pdf, s.has_preview, s.sha256, s.ocr_status
                 FROM sheets s
                 {where_sql}
                 ORDER BY s.category, s.subcategory, s.title, s.page_no
@@ -458,28 +601,65 @@ def get_drawing_detail(sheet_id: str, request: Request, user: dict[str, Any] = D
             raise HTTPException(status_code=404, detail="도면을 찾을 수 없습니다")
         sheet = dict(row)
         tag_rows = conn.execute(
-            "SELECT id, tag, kind, func, unit, loop, x0, y0, x1, y1, confidence, source, raw_text "
-            "FROM tags WHERE sheet_id = ? ORDER BY tag, y0",
+            "SELECT id, tag, canonical_tag, loop_key, kind, func, unit, loop, x0, y0, x1, y1, confidence, source, raw_text "
+            "FROM tags WHERE sheet_id = ? ORDER BY kind, tag, y0",
             (sheet_id,),
         ).fetchall()
         tags = [dict(t) for t in tag_rows]
 
-        # 각 태그가 다른 도면(P&ID, 결선도, 배선도, 데이터시트 등)에 몇 번 등장하는지 교차 카운트
-        tag_names = sorted({t["tag"] for t in tags})
+        # 정규화 키(canonical_tag) 기준 교차 등장 도면 수 집계 (_ ↔ - 통합)
+        canon_names = sorted({t["canonical_tag"] or canonicalize_tag(t["tag"]) for t in tags})
         cross_counts: dict[str, int] = {}
-        if tag_names:
-            placeholders = ",".join("?" for _ in tag_names)
+        if canon_names:
+            placeholders = ",".join("?" for _ in canon_names)
             for cr in conn.execute(
-                f"SELECT tag, COUNT(DISTINCT sheet_id) AS cnt FROM tags "
-                f"WHERE tag IN ({placeholders}) GROUP BY tag",
-                tag_names,
+                f"SELECT canonical_tag, COUNT(DISTINCT sheet_id) AS cnt FROM tags "
+                f"WHERE canonical_tag IN ({placeholders}) GROUP BY canonical_tag",
+                canon_names,
             ).fetchall():
-                cross_counts[cr["tag"]] = cr["cnt"]
+                cross_counts[cr["canonical_tag"]] = cr["cnt"]
 
         for t in tags:
-            t["sheet_count"] = cross_counts.get(t["tag"], 1)
+            ck = t["canonical_tag"] or canonicalize_tag(t["tag"])
+            t["sheet_count"] = cross_counts.get(ck, 1)
 
-        # 같은 원본 PDF의 형제 페이지 정보 (P&ID 멀티페이지 이동용)
+        # 도면 간 연결 화살표 (나가는 화살표 + 이 도면을 가리키는 유입 화살표)
+        continuations: list[dict[str, Any]] = []
+        incoming_continuations: list[dict[str, Any]] = []
+        try:
+            for cr in conn.execute(
+                """
+                SELECT c.id, c.direction, c.fluid, c.target_dwg, c.target_sheet_id, c.label,
+                       c.x0, c.y0, c.x1, c.y1, c.source,
+                       ts.title AS target_title, ts.category AS target_category,
+                       ts.subcategory AS target_subcategory, ts.page_no AS target_page_no,
+                       ts.drawing_no AS target_drawing_no
+                FROM continuations c
+                LEFT JOIN sheets ts ON ts.sheet_id = c.target_sheet_id
+                WHERE c.sheet_id = ?
+                ORDER BY c.y0, c.x0
+                """,
+                (sheet_id,),
+            ).fetchall():
+                continuations.append(dict(cr))
+            for ir in conn.execute(
+                """
+                SELECT c.id, c.sheet_id AS from_sheet_id, c.direction, c.fluid, c.label,
+                       fs.title AS from_title, fs.category AS from_category,
+                       fs.page_no AS from_page_no, fs.drawing_no AS from_drawing_no
+                FROM continuations c
+                JOIN sheets fs ON fs.sheet_id = c.sheet_id
+                WHERE c.target_sheet_id = ? AND c.sheet_id != ?
+                GROUP BY c.sheet_id, c.fluid, c.label
+                ORDER BY fs.category, fs.title, fs.page_no
+                LIMIT 30
+                """,
+                (sheet_id, sheet_id),
+            ).fetchall():
+                incoming_continuations.append(dict(ir))
+        except sqlite3.Error:
+            pass
+
         siblings = [
             dict(r)
             for r in conn.execute(
@@ -509,6 +689,8 @@ def get_drawing_detail(sheet_id: str, request: Request, user: dict[str, Any] = D
     sheet["v"] = sheet["sha256"][:8]
     sheet["is_favorite"] = fav
     sheet["tags"] = tags
+    sheet["continuations"] = continuations
+    sheet["incoming_continuations"] = incoming_continuations
     sheet["siblings"] = siblings
     sheet["pins"] = pins
     return sheet
@@ -519,15 +701,24 @@ def search_tags(
     q: str = Query(default="", max_length=100),
     kind: str = Query(default="", max_length=40),
     func: str = Query(default="", max_length=16),
-    limit: int = Query(default=60, ge=1, le=200),
+    limit: int = Query(default=80, ge=1, le=200),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
-    if q.strip():
-        where.append("(UPPER(t.tag) LIKE UPPER(?) OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?))")
-        like = f"%{q.strip()}%"
-        params.extend([like, like])
+    q_clean = q.strip()
+    if q_clean:
+        like = f"%{q_clean}%"
+        canon = canonicalize_tag(q_clean)
+        if canon:
+            clike = f"%{canon}%"
+            where.append(
+                "(t.canonical_tag LIKE ? OR t.loop_key LIKE ? OR UPPER(t.tag) LIKE UPPER(?) OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?))"
+            )
+            params.extend([clike, like.upper(), like, like])
+        else:
+            where.append("(UPPER(t.tag) LIKE UPPER(?) OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?))")
+            params.extend([like, like])
     if kind:
         where.append("t.kind = ?")
         params.append(kind)
@@ -539,48 +730,86 @@ def search_tags(
     with drawings_conn() as conn:
         rows = conn.execute(
             f"""
-            SELECT t.tag, t.kind, t.func, COUNT(DISTINCT t.sheet_id) AS sheet_count,
+            SELECT MIN(t.tag) AS tag, t.canonical_tag, t.kind, t.func, t.loop_key,
+                   COUNT(DISTINCT t.sheet_id) AS sheet_count,
                    COUNT(*) AS occurrence_count,
                    GROUP_CONCAT(DISTINCT s.category) AS categories
             FROM tags t
             JOIN sheets s ON s.sheet_id = t.sheet_id
             {where_sql}
-            GROUP BY t.tag, t.kind, t.func
-            ORDER BY sheet_count DESC, t.tag
+            GROUP BY CASE WHEN t.canonical_tag != '' THEN t.canonical_tag ELSE UPPER(t.tag) END, t.kind
+            ORDER BY sheet_count DESC, occurrence_count DESC, tag
             LIMIT ?
             """,
             [*params, limit],
         ).fetchall()
+        kind_counts = {
+            r["kind"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT kind, COUNT(DISTINCT CASE WHEN canonical_tag != '' THEN canonical_tag ELSE UPPER(tag) END) AS cnt "
+                "FROM tags GROUP BY kind"
+            ).fetchall()
+        }
         funcs = [
             {"func": r["func"], "count": r["cnt"]}
             for r in conn.execute(
-                "SELECT func, COUNT(DISTINCT tag) AS cnt FROM tags WHERE func IS NOT NULL "
+                "SELECT func, COUNT(DISTINCT canonical_tag) AS cnt FROM tags WHERE func IS NOT NULL "
                 "GROUP BY func ORDER BY cnt DESC LIMIT 30"
             ).fetchall()
         ]
-    return {"items": [dict(r) for r in rows], "top_funcs": funcs}
+    return {"items": [dict(r) for r in rows], "kind_counts": kind_counts, "top_funcs": funcs}
 
 
 @app.get("/api/tags/{tag_name}/sheets")
 def tag_cross_references(tag_name: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    clean = tag_name.strip()
+    canon = canonicalize_tag(clean)
     with drawings_conn() as conn:
         rows = conn.execute(
             """
-            SELECT t.id, t.tag, t.kind, t.func, t.x0, t.y0, t.x1, t.y1, t.confidence, t.source,
-                   s.sheet_id, s.category, s.subcategory, s.drawing_no, s.title, s.page_no, s.sha256
+            SELECT t.id, t.tag, t.canonical_tag, t.loop_key, t.kind, t.func, t.unit, t.loop,
+                   t.x0, t.y0, t.x1, t.y1, t.confidence, t.source,
+                   s.sheet_id, s.category, s.subcategory, s.revision, s.drawing_no, s.title, s.page_no, s.sha256
             FROM tags t
             JOIN sheets s ON s.sheet_id = t.sheet_id
-            WHERE t.tag = ? COLLATE NOCASE
-            ORDER BY s.category, s.title, s.page_no
+            WHERE (t.canonical_tag = ? AND ? != '') OR t.tag = ? COLLATE NOCASE
             """,
-            (tag_name.strip(),),
+            (canon, canon, clean),
         ).fetchall()
+
+        # 동일 루프/배관 계통 패밀리 태그 조회 (예: N2USCW31 → TCV, TCVI, TY, DPIC / IESL-070602 → 분기라인)
+        loop_keys = sorted({r["loop_key"] for r in rows if r["loop_key"] and len(r["loop_key"]) >= 4})
+        family: list[dict[str, Any]] = []
+        if loop_keys:
+            lph = ",".join("?" for _ in loop_keys)
+            frows = conn.execute(
+                f"""
+                SELECT MIN(tag) AS tag, canonical_tag, kind, func,
+                       COUNT(DISTINCT sheet_id) AS sheet_count
+                FROM tags
+                WHERE loop_key IN ({lph}) AND canonical_tag != ?
+                GROUP BY canonical_tag, kind
+                ORDER BY sheet_count DESC, tag
+                LIMIT 24
+                """,
+                [*loop_keys, canon],
+            ).fetchall()
+            family = [dict(fr) for fr in frows]
+
     items = []
     for r in rows:
         d = dict(r)
         d["v"] = d["sha256"][:8]
         items.append(d)
-    return {"tag": tag_name, "count": len(items), "occurrences": items}
+    # 공종 흐름 순서(P&ID → 계기결선 HCD → 배선 WRP → 배치/전원 → 전력제어 → SHOP)로 자동 정렬
+    items.sort(key=lambda x: (*_discipline_rank(x["category"], x["subcategory"]), x["title"], x["page_no"]))
+    return {
+        "tag": clean,
+        "loop_key": loop_keys[0] if loop_keys else "",
+        "count": len(items),
+        "occurrences": items,
+        "family": family,
+    }
 
 
 # ── 즐겨찾기 ────────────────────────────────────────────────────────────────

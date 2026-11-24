@@ -304,3 +304,147 @@ def test_revision_filter_search_snippet_and_field_pins_idor(client):
     assert len(c.get("/api/drawings/S1", headers=hdr_eng).json()["pins"]) == 1
     assert c.delete(f"/api/pins/{pin_id}", headers=hdr_admin).status_code == 200
     assert len(c.get("/api/sheets/S1/pins", headers=hdr_admin).json()["items"]) == 0
+
+
+def test_v130_plant_parser_trigram_substring_lineage_and_continuations(client, tmp_path):
+    from scripts.build_index import (
+        _write_drawings_db_atomic,
+        extract_dwg_meta_and_continuations,
+        extract_tags_from_words,
+        snap_ocr_token,
+    )
+    from scripts.ocr_engine import needs_ocr
+
+    # 1) 선택적 OCR 판별 (표제란만 있는 SHX vs 디지털 본문)
+    shx_text = "PROJECT TITLE PROJECT CODE DRAWING TITLE OWNER CONTRACTOR REV DATE 12345678 ABCDEF M M M"
+    digital_text = (
+        "COOLING WATER SUPPLY SYSTEM 550A-CWR-061213-A1X TCV N2USCW31 DPIC N2USCW31 "
+        "BFV-006R08 BV-006R07 HEX_N2US0501 CWP_N2US0701 AHU_N2US0101 CONTROL VALVE NOTES"
+    )
+    assert needs_ocr(shx_text) is True
+    assert needs_ocr(digital_text) is False
+
+    # 2) NRD-K2 언더스코어·6자리 배관·수동밸브·2줄 영숫자 버블·OCR 퍼지 보정·연결 화살표 파싱 검증
+    words = [
+        {"text": "550A-CWR-061213-A1X", "x0": 0.20, "y0": 0.20, "x1": 0.35, "y1": 0.22, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "110A-IESL-070602B-A1Y", "x0": 0.20, "y0": 0.26, "x1": 0.36, "y1": 0.28, "confidence": 0.99, "source": "ocr"},
+        {"text": "TIC_N2USHCW31", "x0": 0.40, "y0": 0.30, "x1": 0.50, "y1": 0.32, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "ICGP_N2GC0202A", "x0": 0.12, "y0": 0.40, "x1": 0.24, "y1": 0.42, "confidence": 0.99, "source": "ocr"},
+        {"text": "ICGP_N2GC0202B", "x0": 0.12, "y0": 0.55, "x1": 0.24, "y1": 0.57, "confidence": 1.00, "source": "ocr"},
+        {"text": "*BFV-006R08", "x0": 0.55, "y0": 0.22, "x1": 0.63, "y1": 0.24, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "MCC-NK2U1B4-A", "x0": 0.60, "y0": 0.30, "x1": 0.72, "y1": 0.32, "confidence": 1.0, "source": "pdf_text"},
+        # 2줄 버블 (TCV / N2USCW31, DPIC / N2USCW31)
+        {"text": "TCV", "x0": 0.30, "y0": 0.48, "x1": 0.33, "y1": 0.495, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "N2USCW31", "x0": 0.29, "y0": 0.50, "x1": 0.35, "y1": 0.515, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "DPIC", "x0": 0.42, "y0": 0.48, "x1": 0.45, "y1": 0.495, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "N2USCW31", "x0": 0.41, "y0": 0.50, "x1": 0.47, "y1": 0.515, "confidence": 1.0, "source": "pdf_text"},
+        # 사각 DCS 버블 OCR 오타 보정 (KC / NQGP_N2GC0202A → KC_ICGP_N2GC0202A)
+        {"text": "KC", "x0": 0.28, "y0": 0.40, "x1": 0.31, "y1": 0.415, "confidence": 1.0, "source": "ocr"},
+        {"text": "NQGP_N2GC0202A", "x0": 0.27, "y0": 0.42, "x1": 0.33, "y1": 0.435, "confidence": 0.83, "source": "ocr"},
+        # 도면 간 연결 화살표 (좌측 경계) + 자체 표제란 ID (우하단)
+        {"text": "CWR", "x0": 0.05, "y0": 0.14, "x1": 0.09, "y1": 0.155, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "K0919000_PCDP001_006A", "x0": 0.04, "y0": 0.16, "x1": 0.16, "y1": 0.175, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "FR", "x0": 0.05, "y0": 0.18, "x1": 0.07, "y1": 0.195, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "HEX_N2US0501", "x0": 0.08, "y0": 0.18, "x1": 0.17, "y1": 0.195, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "K0919000_PCDP001_006R", "x0": 0.72, "y0": 0.88, "x1": 0.88, "y1": 0.90, "confidence": 1.0, "source": "pdf_text"},
+        {"text": "SF7544-ES0D-PID-F11U-U006R", "x0": 0.72, "y0": 0.84, "x1": 0.90, "y1": 0.86, "confidence": 1.0, "source": "pdf_text"},
+    ]
+    tags = extract_tags_from_words(words)
+    by_tag = {t["tag"]: t for t in tags}
+    assert "550A-CWR-061213-A1X" in by_tag and by_tag["550A-CWR-061213-A1X"]["kind"] == "line_no"
+    assert by_tag["550A-CWR-061213-A1X"]["loop_key"] == "CWR-061213"
+    assert "110A-IESL-070602B-A1Y" in by_tag and by_tag["110A-IESL-070602B-A1Y"]["loop_key"] == "IESL-070602"
+    assert "TIC_N2USHCW31" in by_tag and by_tag["TIC_N2USHCW31"]["kind"] == "instrument"
+    assert "BFV-006R08" in by_tag and by_tag["BFV-006R08"]["kind"] == "valve"
+    assert "MCC-NK2U1B4-A" in by_tag and by_tag["MCC-NK2U1B4-A"]["loop_key"] == "NK2U1B4"
+    assert "TCV_N2USCW31" in by_tag and "DPIC_N2USCW31" in by_tag
+    assert "KC_ICGP_N2GC0202A" in by_tag
+    assert snap_ocr_token("XXXXXXXXXXXXXX", ["ICGP_N2GC0202A"]) is None
+
+    dwg_no, dwg_id, conts = extract_dwg_meta_and_continuations(words, " ".join(w["text"] for w in words), "UT_PID")
+    assert dwg_no == "SF7544-ES0D-PID-F11U-U006R"
+    assert dwg_id == "K0919000_PCDP001_006R"
+    assert len(conts) == 1 and conts[0]["direction"] == "FR" and conts[0]["fluid"] == "CWR"
+    assert conts[0]["target_dwg"] == "K0919000_PCDP001_006A"
+
+    # 3) 원자 DB 적재 + Trigram 부분검색 + 구분자 무시 추적 + 루프 패밀리 + 연결 화살표 타겟 해결 E2E
+    c, data_dir = client
+    stage_dir = tmp_path / "stage_v130"
+    stage_dir.mkdir()
+    sheets = [
+        {
+            "sheet_id": "PID_006R", "category": "P&ID", "subcategory": "2_AFC_0 · UT공정 P&ID",
+            "revision": "2_AFC_0", "drawing_no": dwg_no, "drawing_id": dwg_id, "title": "UT P&ID U006R",
+            "source_file": "2_AFC_0/4_P&ID/UT.pdf", "file_type": "pdf", "page_no": 1, "total_pages": 2,
+            "width_px": 3400, "height_px": 2400, "tile_cols": 4, "tile_rows": 3, "tile_size": 1024,
+            "sha256": "abcd1111", "has_pdf": 1, "has_preview": 1, "extra_categories": "", "ocr_status": "ocr_done",
+            "full_text": "무기통합2차폐수 MVD_N2USAHU0301AA 550A-CWR-061213-A1X TIC_N2USHCW31",
+            "tags": tags, "continuations": conts,
+        },
+        {
+            "sheet_id": "PID_006A", "category": "P&ID", "subcategory": "2_AFC_0 · UT공정 P&ID",
+            "revision": "2_AFC_0", "drawing_no": "SF7544-ES0D-PID-F11U-U006A", "drawing_id": "K0919000_PCDP001_006A",
+            "title": "UT P&ID U006A", "source_file": "2_AFC_0/4_P&ID/UT.pdf", "file_type": "pdf",
+            "page_no": 2, "total_pages": 2, "width_px": 3400, "height_px": 2400, "tile_cols": 4, "tile_rows": 3,
+            "tile_size": 1024, "sha256": "abcd1111", "has_pdf": 1, "has_preview": 1, "extra_categories": "",
+            "ocr_status": "", "full_text": "HEX_N2US0501 550A-CWR-061213-A1X",
+            "tags": [
+                {"tag": "TIC-N2USHCW31", "kind": "instrument", "func": "TIC", "unit": None, "loop": "N2USHCW31",
+                 "x0": 0.2, "y0": 0.2, "x1": 0.3, "y1": 0.25, "confidence": 1.0, "source": "pdf_text", "raw_text": "TIC-N2USHCW31"},
+            ],
+            "continuations": [],
+        },
+        {
+            "sheet_id": "HCD_001", "category": "제어 도면", "subcategory": "2_AFC_0 · 계기 결선도(HCD)",
+            "revision": "2_AFC_0", "drawing_no": "SF7544-EK0D-HCD-F11U-0001", "drawing_id": "",
+            "title": "HCD-0001", "source_file": "2_AFC_0/2_제어/HCD.pdf", "file_type": "pdf",
+            "page_no": 1, "total_pages": 1, "width_px": 1600, "height_px": 1130, "tile_cols": 0, "tile_rows": 0,
+            "tile_size": 0, "sha256": "efgh2222", "has_pdf": 1, "has_preview": 1, "extra_categories": "",
+            "ocr_status": "", "full_text": "TIC_N2USHCW31 WIRING",
+            "tags": [
+                {"tag": "TIC_N2USHCW31", "kind": "instrument", "func": "TIC", "unit": None, "loop": "N2USHCW31",
+                 "x0": 0.3, "y0": 0.3, "x1": 0.4, "y1": 0.35, "confidence": 1.0, "source": "pdf_text", "raw_text": "TIC_N2USHCW31"},
+            ],
+            "continuations": [],
+        },
+    ]
+    _write_drawings_db_atomic(stage_dir, sheets, {"project": "NRD-K2"}, run_vacuum=False)
+    bundle = _make_tar({"drawings.db": (stage_dir / "drawings.db").read_bytes()})
+    assert c.post("/api/admin/sync", headers={"X-Sync-Token": "sync-secret-xyz"},
+                  files={"bundle": ("v130.tar.gz", bundle, "application/gzip")}).status_code == 200
+
+    tok = c.post("/api/auth/login", json={"username": "admin", "password": "testpass123"}).json()["token"]
+    hdr = {"Authorization": f"Bearer {tok}"}
+
+    # Trigram 부분 문자열 검색: '61213', 'AHU0301', '무기통합'
+    for subq in ("61213", "AHU0301", "무기통합"):
+        r = c.get(f"/api/drawings?q={subq}", headers=hdr).json()
+        assert r["total"] >= 1 and any(it["sheet_id"] == "PID_006R" for it in r["items"])
+        hit = next(it for it in r["items"] if it["sheet_id"] == "PID_006R")
+        assert "[[H]]" in hit.get("snippet", "")
+
+    # 구분자 무시(_ ↔ -) 공종별 추적 순서(P&ID 먼저, 제어 도면 다음)
+    xref = c.get("/api/tags/TIC-N2USHCW31/sheets", headers=hdr).json()
+    assert xref["count"] == 3
+    assert xref["occurrences"][0]["category"] == "P&ID"
+    assert xref["occurrences"][-1]["category"] == "제어 도면"
+
+    # 루프 패밀리 검증 (TCV_N2USCW31 → DPIC_N2USCW31 자동 연결)
+    fam = c.get("/api/tags/TCV_N2USCW31/sheets", headers=hdr).json()
+    assert fam["loop_key"] == "N2USCW31"
+    assert any(f["tag"] == "DPIC_N2USCW31" for f in fam["family"])
+
+    # 배관 라인 유형 필터 검증
+    lines = c.get("/api/tags?kind=line_no&q=061213", headers=hdr).json()
+    assert len(lines["items"]) == 1 and lines["items"][0]["tag"] == "550A-CWR-061213-A1X"
+    assert lines["kind_counts"]["line_no"] >= 2
+
+    # 도면 간 연결 화살표(나가는/유입) 자동 해결 검증
+    det_r = c.get("/api/drawings/PID_006R", headers=hdr).json()
+    assert det_r["ocr_status"] == "ocr_done"
+    assert len(det_r["continuations"]) == 1
+    assert det_r["continuations"][0]["target_sheet_id"] == "PID_006A"
+
+    det_a = c.get("/api/drawings/PID_006A", headers=hdr).json()
+    assert len(det_a["incoming_continuations"]) == 1
+    assert det_a["incoming_continuations"][0]["from_sheet_id"] == "PID_006R"

@@ -10,15 +10,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates tzdata rclone \
+    && apt-get install -y --no-install-recommends curl ca-certificates tzdata rclone libgomp1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pypdfium2 pillow pypdf
+    && pip install --no-cache-dir pypdfium2 pillow pypdf rapidocr onnxruntime
 
 COPY backend ./backend
 COPY scripts ./scripts
 COPY worker ./worker
 
-RUN mkdir -p /app/data /app/worker_state \
+RUN python -m scripts.ocr_engine --warmup \
+    && mkdir -p /app/data /app/worker_state \
     && useradd --create-home --uid 1000 appuser \
     && chown -R appuser:appuser /app
 

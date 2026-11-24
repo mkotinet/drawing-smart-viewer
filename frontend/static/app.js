@@ -6,10 +6,18 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.3.0';
   const USER_KEY = 'dsv_auth_user';
   const THEME_KEY = 'dsv_theme';
   const TILE_CACHE_NAME = 'dsv-tiles-v1.0.0';
+  const KIND_LABELS = {
+    instrument: '계기',
+    line_no: '배관 라인',
+    equipment: '설비',
+    valve: '밸브',
+    continuation: '연결 화살표',
+  };
+  const canonicalizeTag = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
   // 구버전 localStorage 세션 토큰 잔여분 자동 제거 (HttpOnly 쿠키 일원화)
   try { localStorage.removeItem('dsv_auth_token'); } catch (_) {}
 
@@ -40,6 +48,8 @@
     revision: '',
     category: '',
     subcategory: '',
+    tagKind: '',
+    inspectorKind: '',
     q: '',
     page: 1,
     totalPages: 1,
@@ -349,21 +359,24 @@
         $('categoryStrip').hidden = true;
         $('subCategoryStrip').hidden = true;
         pager.hidden = true;
-        const data = await api(`/api/tags?q=${encodeURIComponent(state.q)}&limit=120`);
-        meta.textContent = `계기·라인 태그 ${data.items.length}건 표시`;
+        const kindParam = state.tagKind ? `&kind=${encodeURIComponent(state.tagKind)}` : '';
+        const data = await api(`/api/tags?q=${encodeURIComponent(state.q)}${kindParam}&limit=150`);
+        renderTagKindStrip(data.kind_counts || {});
+        meta.textContent = `계기·배관·설비 ${data.items.length}건 표시`;
         box.innerHTML = '';
         if (!data.items.length) {
-          box.innerHTML = '<div class="list-meta">일치하는 태그가 없습니다.</div>';
+          box.innerHTML = '<div class="list-meta">일치하는 계기·배관 태그가 없습니다.</div>';
           return;
         }
         for (const item of data.items) {
           const btn = document.createElement('button');
           btn.type = 'button';
           btn.className = 'tag-row';
+          const klabel = KIND_LABELS[item.kind] || item.kind;
           btn.innerHTML = `
             <div class="sheet-info">
-              <div class="tag-code">${escapeHtml(item.tag)}</div>
-              <div class="tag-meta">도면 ${item.sheet_count}장 · ${escapeHtml(item.categories || '')}</div>
+              <div class="tag-code"><span class="kind-pill kind-${escapeHtml(item.kind)}">${escapeHtml(klabel)}</span>${escapeHtml(item.tag)}</div>
+              <div class="tag-meta">도면 ${item.sheet_count}장 (${item.occurrence_count}회) · ${escapeHtml(item.categories || '')}</div>
             </div>
           `;
           btn.addEventListener('click', () => openTagCrossRef(item.tag));
@@ -372,6 +385,7 @@
         return;
       }
 
+      $('tagKindStrip').hidden = true;
       $('categoryStrip').hidden = false;
       if ((state.stats?.revisions || []).length > 1) $('revisionStrip').hidden = false;
       const params = new URLSearchParams({
@@ -450,12 +464,14 @@
       $('stageLayer').hidden = false;
       $('zoomControls').hidden = false;
       $('docCatBadge').textContent = sheet.category;
-      $('shxBadge').hidden = !(sheet.extra_categories || '').includes('SHX');
+      $('ocrBadge').hidden = sheet.ocr_status !== 'ocr_done';
+      $('shxBadge').hidden = sheet.ocr_status === 'ocr_done' || !(sheet.extra_categories || '').includes('SHX');
       $('docTitle').textContent = sheet.title;
       $('docSub').textContent = sheet.total_pages > 1
         ? `${sheet.subcategory} · ${sheet.page_no}/${sheet.total_pages}p`
         : sheet.subcategory;
-      $('sheetTagCount').textContent = String(sheet.tags.length);
+      const totalItems = (sheet.tags || []).length + (sheet.continuations || []).length;
+      $('sheetTagCount').textContent = String(totalItems);
 
       const favBtn = $('btnFavorite');
       favBtn.classList.toggle('fav-on', !!sheet.is_favorite);
@@ -503,7 +519,11 @@
         if (seq !== state.openReqSeq) return;
         $('canvasLoading').hidden = true;
         if (focusTagName) {
-          const hit = sheet.tags.find((t) => t.tag.toUpperCase() === focusTagName.toUpperCase());
+          const wantCanon = canonicalizeTag(focusTagName);
+          const hit = sheet.tags.find((t) =>
+            t.tag.toUpperCase() === focusTagName.toUpperCase() ||
+            (wantCanon && (t.canonical_tag === wantCanon || canonicalizeTag(t.tag) === wantCanon))
+          );
           if (hit) {
             focusTag(hit);
             return;
@@ -518,9 +538,12 @@
       };
       img.src = `/api/sheets/${encodeURIComponent(sheet.sheet_id)}/preview.webp?v=${sheet.v}`;
 
-      renderOverlayBoxes(sheet.tags);
+      state.inspectorKind = '';
+      renderOverlayBoxes(sheet.tags || [], sheet.continuations || []);
+      renderContinuations(sheet.continuations || [], sheet.incoming_continuations || []);
       renderPins(sheet.pins || []);
-      renderInspector(sheet.tags);
+      renderInspectorKinds(sheet.tags || []);
+      renderInspector(sheet.tags || [], $('inspectorSearch')?.value || '');
 
       document.querySelectorAll('.sheet-row').forEach((el) => el.classList.remove('active'));
     } catch (err) {
@@ -595,15 +618,77 @@
     applyTransform();
   }
 
-  function renderOverlayBoxes(tags) {
+  function renderTagKindStrip(kindCounts) {
+    const strip = $('tagKindStrip');
+    const total = Object.values(kindCounts).reduce((a, b) => a + b, 0);
+    if (!total) {
+      strip.hidden = true;
+      strip.innerHTML = '';
+      return;
+    }
+    strip.hidden = false;
+    strip.innerHTML = '';
+    const order = [
+      ['', '전체', total],
+      ['instrument', '계기', kindCounts.instrument || 0],
+      ['line_no', '배관 라인', kindCounts.line_no || 0],
+      ['equipment', '설비', kindCounts.equipment || 0],
+      ['valve', '밸브', kindCounts.valve || 0],
+    ];
+    for (const [val, label, cnt] of order) {
+      if (val && !cnt) continue;
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip' + (state.tagKind === val ? ' active' : '');
+      b.innerHTML = `<span>${escapeHtml(label)}</span><span class="cnt">${cnt.toLocaleString()}</span>`;
+      b.addEventListener('click', () => {
+        state.tagKind = val;
+        refreshList();
+      });
+      strip.appendChild(b);
+    }
+  }
+
+  function renderInspectorKinds(tags) {
+    const strip = $('inspectorKindStrip');
+    if (!strip) return;
+    const counts = { instrument: 0, line_no: 0, equipment: 0, valve: 0 };
+    for (const t of tags) {
+      if (counts[t.kind] !== undefined) counts[t.kind]++;
+    }
+    strip.innerHTML = '';
+    const order = [
+      ['', '전체', tags.length],
+      ['instrument', '계기', counts.instrument],
+      ['line_no', '배관', counts.line_no],
+      ['equipment', '설비', counts.equipment],
+      ['valve', '밸브', counts.valve],
+    ];
+    for (const [val, label, cnt] of order) {
+      if (val && !cnt) continue;
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip' + (state.inspectorKind === val ? ' active' : '');
+      b.innerHTML = `<span>${escapeHtml(label)}</span><span class="cnt">${cnt}</span>`;
+      b.addEventListener('click', () => {
+        state.inspectorKind = val;
+        renderInspectorKinds(tags);
+        renderInspector(tags, $('inspectorSearch')?.value || '');
+      });
+      strip.appendChild(b);
+    }
+  }
+
+  function renderOverlayBoxes(tags, continuations = []) {
     const layer = $('overlayLayer');
     layer.innerHTML = '';
     layer.classList.toggle('hidden-boxes', !state.showBoxes);
     for (const t of tags) {
       const div = document.createElement('div');
-      div.className = 'tag-box';
+      div.className = `tag-box kind-${t.kind || 'instrument'}`;
       div.dataset.tagId = String(t.id);
-      div.title = `${t.tag} (${t.sheet_count}장 연동)`;
+      const klabel = KIND_LABELS[t.kind] || t.kind;
+      div.title = `[${klabel}] ${t.tag} (${t.sheet_count}장 연동${t.source === 'ocr' ? ' · OCR' : ''})`;
       div.style.left = `${t.x0 * 100}%`;
       div.style.top = `${t.y0 * 100}%`;
       div.style.width = `${Math.max((t.x1 - t.x0) * 100, 0.8)}%`;
@@ -614,26 +699,102 @@
       });
       layer.appendChild(div);
     }
+    for (const c of continuations) {
+      const div = document.createElement('div');
+      div.className = 'tag-box kind-continuation';
+      const targetTxt = c.target_title || c.target_dwg;
+      div.title = `[연결 화살표] ${c.direction || ''} ${c.fluid || ''} ${c.label || ''} → ${targetTxt}${c.target_sheet_id ? ' (클릭해 이동)' : ''}`.trim();
+      div.style.left = `${c.x0 * 100}%`;
+      div.style.top = `${c.y0 * 100}%`;
+      div.style.width = `${Math.max((c.x1 - c.x0) * 100, 1.2)}%`;
+      div.style.height = `${Math.max((c.y1 - c.y0) * 100, 1.0)}%`;
+      div.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (c.target_sheet_id) {
+          showToast(`연결 도면으로 이동: ${targetTxt}`);
+          openSheet(c.target_sheet_id);
+        } else {
+          $('inspector').hidden = false;
+          showToast(`상대 도면(${c.target_dwg})이 현재 인덱스에 없습니다`);
+        }
+      });
+      layer.appendChild(div);
+    }
+  }
+
+  function renderContinuations(outgoing, incoming) {
+    const box = $('continuationBox');
+    if (!box) return;
+    if ((!outgoing || !outgoing.length) && (!incoming || !incoming.length)) {
+      box.hidden = true;
+      box.innerHTML = '';
+      return;
+    }
+    box.hidden = false;
+    const total = (outgoing?.length || 0) + (incoming?.length || 0);
+    box.innerHTML = `<div class="cross-ref-title">도면 간 연결 화살표 (${total})</div>`;
+    for (const c of (outgoing || [])) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'cross-ref-item';
+      const dir = c.direction || '연결';
+      const targetLabel = c.target_title ? `${c.target_title}${c.target_page_no > 1 ? ` (p.${c.target_page_no})` : ''}` : c.target_dwg;
+      btn.innerHTML = `
+        <span><span class="cont-dir">${escapeHtml(dir)}</span><strong>${escapeHtml(c.fluid || 'LINE')}</strong> ${escapeHtml(c.label || targetLabel)}</span>
+        <span class="tag-meta">${c.target_sheet_id ? '이동 →' : '위치'}</span>
+      `;
+      btn.addEventListener('click', () => {
+        if (c.target_sheet_id) {
+          openSheet(c.target_sheet_id);
+        } else {
+          zoomToNormalized((c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2);
+        }
+      });
+      box.appendChild(btn);
+    }
+    for (const inc of (incoming || [])) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'cross-ref-item';
+      btn.innerHTML = `
+        <span><span class="cont-dir">유입</span><strong>${escapeHtml(inc.fluid || 'LINE')}</strong> ${escapeHtml(inc.from_title)}${inc.from_page_no > 1 ? ` (p.${inc.from_page_no})` : ''}</span>
+        <span class="tag-meta">← 이동</span>
+      `;
+      btn.addEventListener('click', () => openSheet(inc.from_sheet_id));
+      box.appendChild(btn);
+    }
   }
 
   function renderInspector(tags, filterText = '') {
     const list = $('inspectorList');
     const q = filterText.trim().toUpperCase();
-    const filtered = q ? tags.filter((t) => t.tag.toUpperCase().includes(q) || (t.func || '').includes(q)) : tags;
-    $('inspectorTitle').textContent = `시트 내 태그 (${filtered.length})`;
+    const qCanon = canonicalizeTag(q);
+    const filtered = tags.filter((t) => {
+      if (state.inspectorKind && t.kind !== state.inspectorKind) return false;
+      if (!q) return true;
+      return (
+        t.tag.toUpperCase().includes(q) ||
+        (qCanon && (t.canonical_tag || '').includes(qCanon)) ||
+        (t.func || '').includes(q) ||
+        (t.loop_key || '').includes(q)
+      );
+    });
+    $('inspectorTitle').textContent = `시트 내 개체 (${filtered.length})`;
     list.innerHTML = '';
     if (!filtered.length) {
-      list.innerHTML = '<div class="list-meta">추출된 태그가 없습니다.</div>';
+      list.innerHTML = '<div class="list-meta">추출된 계기·배관 태그가 없습니다.</div>';
       return;
     }
     for (const t of filtered) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'tag-row' + (state.selectedTagId === t.id ? ' active' : '');
+      const klabel = KIND_LABELS[t.kind] || t.kind;
+      const ocrFlag = t.source === 'ocr' ? ' · OCR' : '';
       btn.innerHTML = `
         <div class="sheet-info">
-          <div class="tag-code">${escapeHtml(t.tag)}</div>
-          <div class="tag-meta">${escapeHtml(t.kind)}${t.sheet_count > 1 ? ` · 다른 도면 ${t.sheet_count - 1}장` : ''}</div>
+          <div class="tag-code"><span class="kind-pill kind-${escapeHtml(t.kind)}">${escapeHtml(klabel)}</span>${escapeHtml(t.tag)}</div>
+          <div class="tag-meta">${t.sheet_count > 1 ? `연관 도면 ${t.sheet_count}장` : '단독 등장'}${ocrFlag}</div>
         </div>
       `;
       btn.addEventListener('click', () => focusTag(t));
@@ -690,19 +851,20 @@
 
   function renderCrossRefBox(data) {
     const box = $('crossRefBox');
-    if (!data || !data.occurrences.length) {
+    if (!data || (!data.occurrences.length && !(data.family || []).length)) {
       box.hidden = true;
       return;
     }
     box.hidden = false;
-    box.innerHTML = `<div class="cross-ref-title">${escapeHtml(data.tag)} — 연관 도면 ${data.occurrences.length}곳</div>`;
+    box.innerHTML = `<div class="cross-ref-title">${escapeHtml(data.tag)} — 공종별 추적 ${data.occurrences.length}곳</div>`;
     for (const occ of data.occurrences) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'cross-ref-item';
       const isCurrent = state.sheet?.sheet_id === occ.sheet_id;
+      const revTag = occ.revision ? `[${occ.revision}] ` : '';
       btn.innerHTML = `
-        <span><strong>${escapeHtml(occ.category)}</strong> ${escapeHtml(occ.title)}${occ.page_no > 1 ? ` (p.${occ.page_no})` : ''}</span>
+        <span><strong>${escapeHtml(occ.category)}</strong> ${escapeHtml(revTag + occ.title)}${occ.page_no > 1 ? ` (p.${occ.page_no})` : ''}</span>
         <span class="tag-meta">${isCurrent ? '현재' : '이동'}</span>
       `;
       btn.addEventListener('click', () => {
@@ -713,6 +875,24 @@
         }
       });
       box.appendChild(btn);
+    }
+    if (data.family && data.family.length) {
+      const fam = document.createElement('div');
+      fam.className = 'family-strip';
+      fam.innerHTML = `<div class="family-label">동일 루프/배관 계통 (${escapeHtml(data.loop_key || '연관')} · ${data.family.length}종)</div>`;
+      const chips = document.createElement('div');
+      chips.className = 'family-chips';
+      for (const f of data.family) {
+        const cb = document.createElement('button');
+        cb.type = 'button';
+        cb.className = 'family-chip';
+        cb.title = `${KIND_LABELS[f.kind] || f.kind} · 도면 ${f.sheet_count}장`;
+        cb.textContent = f.tag;
+        cb.addEventListener('click', () => openTagCrossRef(f.tag));
+        chips.appendChild(cb);
+      }
+      fam.appendChild(chips);
+      box.appendChild(fam);
     }
   }
 

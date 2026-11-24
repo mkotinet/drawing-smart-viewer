@@ -30,6 +30,12 @@ PBKDF2_ITERS = 120_000
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 90  # 90일 슬라이딩 만료
 SESSION_TOUCH_INTERVAL_S = 300           # 5분 디바운싱 (타일 요청 쓰기 I/O 99% 절감)
 _REV_DIR_RE = re.compile(r"(?:AFC|AFD|IFC|REV|R\d|^\d+_P&ID)", re.IGNORECASE)
+_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]+")
+
+
+def canonicalize_tag(tag: str) -> str:
+    """구분자(_, -, 공백, *)를 제거한 정규화 대문자 키 (TIC_N2USCW31 == TIC-N2USCW31)."""
+    return _NON_ALNUM_RE.sub("", (tag or "").upper())
 
 
 def extract_revision(source_file: str) -> str:
@@ -121,6 +127,7 @@ def init_drawings_db(path=None) -> None:
                 category TEXT NOT NULL,
                 subcategory TEXT NOT NULL,
                 drawing_no TEXT,
+                drawing_id TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL,
                 source_file TEXT NOT NULL,
                 file_type TEXT NOT NULL,
@@ -137,6 +144,7 @@ def init_drawings_db(path=None) -> None:
                 tag_count INTEGER NOT NULL DEFAULT 0,
                 extra_categories TEXT NOT NULL DEFAULT '',
                 revision TEXT NOT NULL DEFAULT '',
+                ocr_status TEXT NOT NULL DEFAULT '',
                 full_text TEXT NOT NULL DEFAULT ''
             );
 
@@ -145,11 +153,14 @@ def init_drawings_db(path=None) -> None:
             CREATE INDEX IF NOT EXISTS idx_sheets_source ON sheets(source_file, page_no);
             CREATE INDEX IF NOT EXISTS idx_sheets_rev ON sheets(revision);
             CREATE INDEX IF NOT EXISTS idx_sheets_dwgno ON sheets(drawing_no);
+            CREATE INDEX IF NOT EXISTS idx_sheets_dwgid ON sheets(drawing_id);
 
             CREATE TABLE IF NOT EXISTS tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sheet_id TEXT NOT NULL,
                 tag TEXT NOT NULL,
+                canonical_tag TEXT NOT NULL DEFAULT '',
+                loop_key TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL,
                 func TEXT,
                 unit TEXT,
@@ -166,8 +177,31 @@ def init_drawings_db(path=None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
             CREATE INDEX IF NOT EXISTS idx_tags_tag_nocase ON tags(tag COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_tags_canonical ON tags(canonical_tag);
+            CREATE INDEX IF NOT EXISTS idx_tags_loop_key ON tags(loop_key);
+            CREATE INDEX IF NOT EXISTS idx_tags_kind ON tags(kind);
             CREATE INDEX IF NOT EXISTS idx_tags_sheet ON tags(sheet_id);
             CREATE INDEX IF NOT EXISTS idx_tags_func ON tags(func);
+
+            CREATE TABLE IF NOT EXISTS continuations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sheet_id TEXT NOT NULL,
+                direction TEXT NOT NULL DEFAULT '',
+                fluid TEXT NOT NULL DEFAULT '',
+                target_dwg TEXT NOT NULL,
+                target_sheet_id TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                x0 REAL NOT NULL,
+                y0 REAL NOT NULL,
+                x1 REAL NOT NULL,
+                y1 REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'pdf_text',
+                FOREIGN KEY(sheet_id) REFERENCES sheets(sheet_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cont_sheet ON continuations(sheet_id);
+            CREATE INDEX IF NOT EXISTS idx_cont_target_dwg ON continuations(target_dwg);
+            CREATE INDEX IF NOT EXISTS idx_cont_target_sheet ON continuations(target_sheet_id);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS sheets_fts USING fts5(
                 sheet_id UNINDEXED,
@@ -186,20 +220,97 @@ def init_drawings_db(path=None) -> None:
         conn.close()
 
 
+def _ensure_trigram_table(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS sheets_trigram USING fts5("
+            "sheet_id UNINDEXED, search_blob, tokenize='trigram')"
+        )
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
 def ensure_drawings_migrations(conn: sqlite3.Connection) -> None:
-    """기존 drawings.db에도 v1.2.0 복합 인덱스·revision 컬럼을 무중단 보강."""
+    """기존 drawings.db에도 v1.2/v1.3 인덱스·컬럼·continuations·trigram을 무중단 보강."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sheets)").fetchall()}
     if "revision" not in cols:
         conn.execute("ALTER TABLE sheets ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
+    if "drawing_id" not in cols:
+        conn.execute("ALTER TABLE sheets ADD COLUMN drawing_id TEXT NOT NULL DEFAULT ''")
+    if "ocr_status" not in cols:
+        conn.execute("ALTER TABLE sheets ADD COLUMN ocr_status TEXT NOT NULL DEFAULT ''")
+
+    tcols = {r[1] for r in conn.execute("PRAGMA table_info(tags)").fetchall()}
+    if "canonical_tag" not in tcols:
+        conn.execute("ALTER TABLE tags ADD COLUMN canonical_tag TEXT NOT NULL DEFAULT ''")
+    if "loop_key" not in tcols:
+        conn.execute("ALTER TABLE tags ADD COLUMN loop_key TEXT NOT NULL DEFAULT ''")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS continuations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_id TEXT NOT NULL,
+            direction TEXT NOT NULL DEFAULT '',
+            fluid TEXT NOT NULL DEFAULT '',
+            target_dwg TEXT NOT NULL,
+            target_sheet_id TEXT NOT NULL DEFAULT '',
+            label TEXT NOT NULL DEFAULT '',
+            x0 REAL NOT NULL,
+            y0 REAL NOT NULL,
+            x1 REAL NOT NULL,
+            y1 REAL NOT NULL,
+            source TEXT NOT NULL DEFAULT 'pdf_text',
+            FOREIGN KEY(sheet_id) REFERENCES sheets(sheet_id) ON DELETE CASCADE
+        )
+    """)
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_cat_order ON sheets(category, subcategory, title, page_no)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_source ON sheets(source_file, page_no)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_rev ON sheets(revision)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sheets_dwgid ON sheets(drawing_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag_nocase ON tags(tag COLLATE NOCASE)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_canonical ON tags(canonical_tag)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_loop_key ON tags(loop_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_kind ON tags(kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cont_sheet ON continuations(sheet_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cont_target_dwg ON continuations(target_dwg)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cont_target_sheet ON continuations(target_sheet_id)")
+
     # 기존 행 중 revision이 비어 있는 다중 리비전 경로 자동 채움
     rows = conn.execute("SELECT sheet_id, source_file FROM sheets WHERE revision = ''").fetchall()
     updates = [(rev, r[0]) for r in rows if (rev := extract_revision(r[1]))]
     if updates:
         conn.executemany("UPDATE sheets SET revision = ? WHERE sheet_id = ?", updates)
+
+    # 기존 태그의 canonical_tag 미설정분 자동 백필
+    trows = conn.execute("SELECT id, tag FROM tags WHERE canonical_tag = ''").fetchall()
+    if trows:
+        conn.executemany(
+            "UPDATE tags SET canonical_tag = ? WHERE id = ?",
+            [(canonicalize_tag(r[1]), r[0]) for r in trows],
+        )
+
+    # FTS5 trigram 가상 테이블 생성 및 기존 데이터 자동 백필 (부분 문자열 초고속 검색)
+    if _ensure_trigram_table(conn):
+        tri_cnt = conn.execute("SELECT COUNT(*) FROM sheets_trigram").fetchone()[0]
+        fts_cnt = conn.execute("SELECT COUNT(*) FROM sheets_fts").fetchone()[0]
+        if tri_cnt == 0 and fts_cnt > 0:
+            fts_rows = conn.execute(
+                "SELECT f.sheet_id, COALESCE(s.drawing_id, '') AS dwgid, "
+                "f.drawing_no, f.title, f.tags_joined, f.full_text "
+                "FROM sheets_fts f LEFT JOIN sheets s ON s.sheet_id = f.sheet_id"
+            ).fetchall()
+            tri_rows = []
+            for fr in fts_rows:
+                canon_tags = " ".join(canonicalize_tag(tok) for tok in (fr[4] or "").split() if tok)
+                blob = " ".join(x for x in (fr[2], fr[1], fr[3], fr[4], canon_tags, fr[5]) if x)
+                tri_rows.append((fr[0], blob[:24_000]))
+            if tri_rows:
+                conn.executemany(
+                    "INSERT INTO sheets_trigram(sheet_id, search_blob) VALUES (?, ?)",
+                    tri_rows,
+                )
 
 
 def init_state_db() -> None:

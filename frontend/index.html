@@ -13,7 +13,7 @@
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png" />
-  <link rel="stylesheet" href="/static/style.css?v=1.2.0" />
+  <link rel="stylesheet" href="/static/style.css?v=1.3.0" />
 </head>
 <body>
   <!-- 로그인 화면 (미인증 시 표시) -->
@@ -64,7 +64,7 @@
 
       <form id="globalSearchForm" class="search-bar" role="search">
         <svg class="search-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="globalSearchInput" type="search" placeholder="계기 태그(TE, TIC), 도면번호(HCD-0001), 키워드 검색..." aria-label="도면 및 태그 검색" />
+        <input id="globalSearchInput" type="search" placeholder="계기 태그(TIC, N2USCW31), 배관 라인(061213, CWR), 도면번호·키워드 검색..." aria-label="도면 및 태그 검색" />
         <button id="btnClearSearch" type="button" class="search-clear" aria-label="검색어 지우기" hidden>
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
@@ -92,13 +92,14 @@
       <aside id="sidebar" class="sidebar" aria-label="도면 탐색기">
         <div class="sidebar-tabs" role="tablist">
           <button type="button" class="tab-btn active" data-tab="drawings" role="tab" aria-selected="true">도면 목록</button>
-          <button type="button" class="tab-btn" data-tab="tags" role="tab" aria-selected="false">계기 태그</button>
+          <button type="button" class="tab-btn" data-tab="tags" role="tab" aria-selected="false">계기·배관</button>
           <button type="button" class="tab-btn" data-tab="favorites" role="tab" aria-selected="false">즐겨찾기</button>
         </div>
 
         <div id="revisionStrip" class="rev-strip" aria-label="리비전 필터" hidden></div>
         <div id="categoryStrip" class="category-strip" aria-label="공종 필터"></div>
         <div id="subCategoryStrip" class="subcat-strip" hidden></div>
+        <div id="tagKindStrip" class="subcat-strip" aria-label="개체 유형 필터" hidden></div>
 
         <div id="listMeta" class="list-meta"></div>
         <div id="listContainer" class="list-container" role="region" aria-live="polite"></div>
@@ -114,6 +115,7 @@
         <div id="viewerHeader" class="viewer-header" hidden>
           <div class="viewer-doc-info">
             <span id="docCatBadge" class="badge">-</span>
+            <span id="ocrBadge" class="badge badge-ocr" title="SHX 벡터 도면을 OCR 인덱싱하여 검색·추적이 활성화되었습니다" hidden>OCR 완료</span>
             <span id="shxBadge" class="badge badge-warn" title="AutoCAD SHX 벡터 도면은 텍스트 레이어가 제한적입니다" hidden>SHX 벡터</span>
             <h2 id="docTitle" class="doc-title">도면을 선택하세요</h2>
             <span id="docSub" class="doc-sub"></span>
@@ -182,9 +184,11 @@
           </button>
         </div>
         <div class="inspector-filter">
-          <input id="inspectorSearch" type="search" placeholder="이 도면 내 태그 필터..." aria-label="현재 도면 태그 필터" />
+          <input id="inspectorSearch" type="search" placeholder="이 도면 내 계기·배관·밸브 필터..." aria-label="현재 도면 태그 필터" />
+          <div id="inspectorKindStrip" class="inspector-kinds" aria-label="시트 내 개체 유형 필터"></div>
         </div>
         <div id="crossRefBox" class="cross-ref-box" hidden></div>
+        <div id="continuationBox" class="cross-ref-box cont-box" hidden></div>
         <div id="pinListBox" class="pin-list-box" hidden></div>
         <div id="inspectorList" class="inspector-list"></div>
       </aside>
@@ -279,6 +283,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-  <script src="/static/app.js?v=1.2.0" defer></script>
+  <script src="/static/app.js?v=1.3.0" defer></script>
 </body>
 </html>
