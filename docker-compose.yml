@@ -19,6 +19,7 @@ services:
       - ADMIN_USER=${ADMIN_USER:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - SYNC_TOKEN=${SYNC_TOKEN}
+      - SYNC_WORKER_URL=${SYNC_WORKER_URL:-http://drawing-sync-worker:8099}
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
     volumes:
       - drawing_viewer_data:/app/data
@@ -29,6 +30,40 @@ services:
       retries: 3
       start_period: 10s
 
+  drawing-sync-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: drawing-sync-worker:latest
+    container_name: ${WORKER_CONTAINER_NAME:-drawing-sync-worker}
+    restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 1024m
+    cpu_shares: 256
+    oom_score_adj: 700
+    environment:
+      - TZ=Asia/Seoul
+      - DATA_DIR=/app/data
+      - WORKER_STATE_DIR=/app/worker_state
+      - GDRIVE_REMOTE_PATH=${GDRIVE_REMOTE_PATH}
+      - RCLONE_CONF_B64=${RCLONE_CONF_B64}
+      - PROJECT_NAME=${PROJECT_NAME:-도면 프로젝트}
+      - SYNC_INTERVAL_MIN=${SYNC_INTERVAL_MIN:-15}
+      - SYNC_TOKEN=${SYNC_TOKEN}
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
+      - VIEWER_PUBLIC_URL=${VIEWER_PUBLIC_URL:-}
+    volumes:
+      - drawing_viewer_data:/app/data
+      - drawing_worker_cache:/app/worker_state
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8099/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
 volumes:
   drawing_viewer_data:
     name: drawing_viewer_data
+  drawing_worker_cache:
+    name: drawing_worker_cache

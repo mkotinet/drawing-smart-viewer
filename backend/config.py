@@ -53,5 +53,9 @@ def get_sync_token() -> str:
     return os.environ.get("SYNC_TOKEN", "")
 
 
+def get_worker_url() -> str:
+    return os.environ.get("SYNC_WORKER_URL", "").strip().rstrip("/")
+
+
 def is_cookie_secure() -> bool:
     return os.environ.get("COOKIE_SECURE", "true").lower() not in ("0", "false", "no")

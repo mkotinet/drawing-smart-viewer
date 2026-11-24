@@ -141,3 +141,61 @@ def test_admin_env_password_sync_and_user_management(client, monkeypatch):
     assert c.delete("/api/admin/users/admin", headers=hdr).status_code == 400
     assert c.delete("/api/admin/users/eng1", headers=hdr).status_code == 200
     assert c.post("/api/auth/login", json={"username": "eng1", "password": "user1234"}).status_code == 401
+
+
+def test_sync_status_and_incremental_classify_path(client):
+    c, data_dir = client
+    from scripts.build_index import classify_path
+
+    # 다중 리비전 경로 분류 검증 (상위 폴더 감시 대응)
+    assert classify_path(Path("2_AFC_0/4_P&ID/sample_UT.pdf")) == ("P&ID", "2_AFC_0 · UT공정 P&ID")
+    assert classify_path(Path("1_AFD_2026.09.11/2_제어/DW0001-U01-HCD-0001.PDF")) == ("제어 도면", "1_AFD_2026.09.11 · 계기 결선도(HCD)")
+    assert classify_path(Path("2_AFC_0/3_제어_AFC(그린동)/GREEN/sheet01.PDF")) == ("제어 도면", "2_AFC_0 · 그린동 제어")
+
+    # 워커 미연결 상태에서도 관리자 동기화 상태 API가 안전 응답(200) 반환
+    tok = c.post("/api/auth/login", json={"username": "admin", "password": "testpass123"}).json()["token"]
+    hdr = {"Authorization": f"Bearer {tok}"}
+    (data_dir / "sync_status.json").write_text('{"state":"idle","last_checked_kst":"2026-11-24 23:00:00 KST"}', encoding="utf-8")
+    st = c.get("/api/admin/sync/status", headers=hdr)
+    assert st.status_code == 200
+    assert st.json()["worker_enabled"] is False
+    assert st.json()["last_checked_kst"] == "2026-11-24 23:00:00 KST"
+    # 워커 미연결 시 trigger는 503 반환
+    assert c.post("/api/admin/sync/trigger", headers=hdr).status_code == 503
+
+
+def test_incremental_index_reuse_add_and_orphan_cleanup(tmp_path):
+    from pypdf import PdfWriter
+    from scripts.build_index import build_index_incremental
+
+    raw_dir = tmp_path / "raw" / "2_AFC_0" / "4_P&ID"
+    raw_dir.mkdir(parents=True)
+    out_dir = tmp_path / "out"
+
+    def _make_blank_pdf(path: Path, width: int = 400, height: int = 300):
+        w = PdfWriter()
+        w.add_blank_page(width=width, height=height)
+        with open(path, "wb") as f:
+            w.write(f)
+
+    pdf1 = raw_dir / "sample_A.PDF"
+    _make_blank_pdf(pdf1, 400, 300)
+
+    # 1차 실행: 신규 1장 추가
+    r1 = build_index_incremental(tmp_path / "raw", out_dir, workers=1, project_name="테스트")
+    assert r1["status"] == "updated" and r1["added_pdfs"] == 1 and r1["total_sheets"] == 1
+    thumb_files = list((out_dir / "thumbs").glob("*.webp"))
+    assert len(thumb_files) == 1
+
+    # 2차 실행(변경 없음): 렌더링 0회, no_changes
+    r2 = build_index_incremental(tmp_path / "raw", out_dir, workers=1, project_name="테스트")
+    assert r2["status"] == "no_changes" and r2["added_pdfs"] == 0 and r2["total_sheets"] == 1
+
+    # 3차 실행(신규 1개 추가 + 기존 1개 삭제): 증분 교체 + 고아 썸네일 삭제
+    pdf2 = raw_dir / "sample_B.pdf"
+    _make_blank_pdf(pdf2, 420, 300)
+    pdf1.unlink()
+    r3 = build_index_incremental(tmp_path / "raw", out_dir, workers=1, project_name="테스트")
+    assert r3["status"] == "updated" and r3["added_pdfs"] == 1 and r3["removed_pdfs"] == 1 and r3["total_sheets"] == 1
+    assert not thumb_files[0].exists()
+    assert len(list((out_dir / "thumbs").glob("*.webp"))) == 1

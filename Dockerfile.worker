@@ -1,0 +1,31 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Seoul \
+    DATA_DIR=/app/data \
+    WORKER_STATE_DIR=/app/worker_state \
+    WORKER_PORT=8099
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates tzdata rclone \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pypdfium2 pillow pypdf
+
+COPY backend ./backend
+COPY scripts ./scripts
+COPY worker ./worker
+
+RUN mkdir -p /app/data /app/worker_state \
+    && useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
+EXPOSE 8099
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -sf http://localhost:8099/healthz || exit 1
+
+CMD ["python", "-u", "worker/sync_worker.py"]

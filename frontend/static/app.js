@@ -6,7 +6,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '1.1.0';
   const TOKEN_KEY = 'dsv_auth_token';
   const USER_KEY = 'dsv_auth_user';
   const THEME_KEY = 'dsv_theme';
@@ -159,6 +159,7 @@
     $('appShell').hidden = false;
     $('userDisplay').textContent = state.user?.username || '사용자';
     $('btnAuditLog').hidden = !state.user?.is_admin;
+    $('btnSyncDrive').hidden = !state.user?.is_admin;
     if (window.innerWidth <= 900) {
       // 모바일에서는 도면 목록을 먼저 보여 선택 유도
       $('sidebar').classList.remove('collapsed');
@@ -879,6 +880,102 @@
         `;
       } catch (err) {
         $('auditBody').innerHTML = `<p class="form-error">${escapeHtml(err.message)}</p>`;
+      }
+    });
+
+    // 구글 드라이브 자동 동기화 패널 (관리자 전용)
+    let syncPollTimer = null;
+    let wasSyncing = false;
+    const stopSyncPoll = () => {
+      if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
+    };
+
+    async function loadSyncPanel() {
+      try {
+        const s = await api('/api/admin/sync/status');
+        const running = s.state && s.state !== 'idle';
+        const stateLabel = !s.worker_enabled
+          ? '워커 미연결'
+          : !s.worker_online
+            ? '워커 오프라인'
+            : s.state === 'syncing_drive'
+              ? '구글 드라이브 변경 확인 중...'
+              : s.state === 'indexing'
+                ? (s.progress?.phase || '신규 도면 타일링 중...')
+                : '대기 중 (자동 감시 활성)';
+        const pillCls = s.last_error ? 'error' : (running ? 'running' : '');
+        const r = s.last_result || {};
+        const alertInfo = s.last_alert
+          ? (s.last_alert.sent
+              ? `전송 성공 (${s.last_alert.at_kst}, HTTP ${s.last_alert.http_status})`
+              : `전송 실패 (${s.last_alert.error || s.last_alert.reason || '-'})`)
+          : (s.n8n_configured ? '대기 중 (변경 감지 시 자동 전송)' : '미설정');
+        const addedHtml = (r.added_files && r.added_files.length)
+          ? `<div><strong>최근 추가/변경 파일 (${r.added_pdfs}건):</strong><ul class="sync-files">${r.added_files.slice(0, 12).map((f) => `<li>${escapeHtml(f)}</li>`).join('')}</ul></div>`
+          : '';
+        $('syncBody').innerHTML = `
+          <div class="sync-meta-list">
+            <div><span class="sync-pill ${pillCls}">${escapeHtml(stateLabel)}</span></div>
+            <div><strong>감시 대상</strong>: <code>${escapeHtml(s.remote_path || '-')}</code></div>
+            <div><strong>자동 감시 주기</strong>: ${escapeHtml(String(s.interval_min || 15))}분마다 증분 확인</div>
+            <div><strong>최근 점검 (KST)</strong>: ${escapeHtml(s.last_checked_kst || '기록 없음')}</div>
+            <div><strong>최근 반영 (KST)</strong>: ${escapeHtml(s.last_updated_kst || '변경 없음')}</div>
+            <div><strong>최근 결과</strong>: 전체 ${Number(r.total_sheets ?? state.stats?.total_sheets ?? 0).toLocaleString()}장 (추가 +${Number(r.added_sheets || 0)}장 · 삭제 -${Number(r.removed_sheets || 0)}장)</div>
+            <div><strong>n8n 실시간 알림</strong>: ${escapeHtml(alertInfo)}</div>
+            ${s.last_error ? `<p class="form-error">최근 오류: ${escapeHtml(s.last_error)}</p>` : ''}
+            ${addedHtml}
+          </div>
+        `;
+        $('btnTriggerSync').disabled = !s.worker_online || running;
+        $('btnTestAlert').disabled = !s.worker_online || !s.n8n_configured;
+
+        if (wasSyncing && !running) {
+          wasSyncing = false;
+          stopSyncPoll();
+          loadStatsAndList();
+          showToast(r.status === 'updated' ? `도면 동기화 완료 (+${r.added_sheets || 0}장)` : '드라이브 점검 완료 (변경 없음)');
+        } else if (running) {
+          wasSyncing = true;
+          if (!syncPollTimer && $('syncDialog').open) {
+            syncPollTimer = setInterval(loadSyncPanel, 3000);
+          }
+        }
+      } catch (err) {
+        $('syncBody').innerHTML = `<p class="form-error">${escapeHtml(err.message)}</p>`;
+      }
+    }
+
+    $('btnSyncDrive').addEventListener('click', () => {
+      $('syncBody').innerHTML = '<p>동기화 상태를 불러오는 중...</p>';
+      $('syncDialog').showModal();
+      loadSyncPanel();
+    });
+    $('syncDialog').addEventListener('close', stopSyncPoll);
+
+    $('btnTriggerSync').addEventListener('click', async () => {
+      $('btnTriggerSync').disabled = true;
+      try {
+        const res = await api('/api/admin/sync/trigger', { method: 'POST' });
+        showToast(res.status === 'already_running' ? '이미 동기화가 진행 중입니다' : '구글 드라이브 동기화를 시작했습니다');
+        wasSyncing = true;
+        loadSyncPanel();
+        if (!syncPollTimer) syncPollTimer = setInterval(loadSyncPanel, 3000);
+      } catch (err) {
+        showToast(`동기화 요청 실패: ${err.message}`);
+        $('btnTriggerSync').disabled = false;
+      }
+    });
+
+    $('btnTestAlert').addEventListener('click', async () => {
+      $('btnTestAlert').disabled = true;
+      try {
+        const res = await api('/api/admin/sync/test-alert', { method: 'POST' });
+        showToast(res.sent ? 'n8n 실시간 알림 테스트 전송 완료' : `알림 전송 실패: ${res.error || res.reason}`);
+        loadSyncPanel();
+      } catch (err) {
+        showToast(`알림 테스트 실패: ${err.message}`);
+      } finally {
+        $('btnTestAlert').disabled = false;
       }
     });
 

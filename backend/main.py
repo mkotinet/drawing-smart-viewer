@@ -8,6 +8,8 @@ import re
 import shutil
 import sqlite3
 import tarfile
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ from backend.config import (
     get_data_dir,
     get_db_path,
     get_sync_token,
+    get_worker_url,
     is_cookie_secure,
     kst_date_str,
     now_kst_iso,
@@ -54,7 +57,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="도면 스마트 뷰어", version="1.0.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="도면 스마트 뷰어", version="1.1.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -623,6 +626,75 @@ async def upload_sync_bundle(
     record_audit(actor, "admin_sync", target=bundle.filename or "bundle.tar.gz",
                  ip=_client_ip(request), detail=f"extracted={extracted}, bytes={len(raw)}, replace_db={replace_db}")
     return {"status": "ok", "extracted_files": extracted, "bytes": len(raw)}
+
+
+def _call_worker(path: str, method: str = "GET", timeout: int = 12) -> dict[str, Any]:
+    worker_url = get_worker_url()
+    if not worker_url:
+        raise HTTPException(status_code=503, detail="자동 동기화 워커(SYNC_WORKER_URL)가 설정되지 않았습니다")
+    req = urllib.request.Request(
+        f"{worker_url}{path}",
+        method=method,
+        headers={"X-Sync-Token": get_sync_token()},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(body)
+        except Exception:
+            detail = body[:300]
+        raise HTTPException(status_code=exc.code, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"동기화 워커 연결 실패: {exc}") from exc
+
+
+@app.get("/api/admin/sync/status")
+def get_sync_status(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    status_file = get_data_dir() / "sync_status.json"
+    file_data: dict[str, Any] = {}
+    if status_file.is_file():
+        try:
+            file_data = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            file_data = {}
+
+    worker_url = get_worker_url()
+    if worker_url:
+        try:
+            live = _call_worker("/status", method="GET", timeout=5)
+            live["worker_enabled"] = True
+            live["worker_online"] = True
+            return live
+        except HTTPException:
+            return {
+                **file_data,
+                "worker_enabled": True,
+                "worker_online": False,
+            }
+    return {
+        **file_data,
+        "worker_enabled": False,
+        "worker_online": False,
+    }
+
+
+@app.post("/api/admin/sync/trigger")
+def trigger_drive_sync(request: Request, admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    res = _call_worker("/trigger", method="POST", timeout=10)
+    record_audit(admin["username"], "trigger_drive_sync", target=str(res.get("status", "")),
+                 ip=_client_ip(request), user_agent=request.headers.get("user-agent", ""))
+    return res
+
+
+@app.post("/api/admin/sync/test-alert")
+def test_n8n_alert(request: Request, admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    res = _call_worker("/test-alert", method="POST", timeout=20)
+    record_audit(admin["username"], "test_n8n_alert", target="ok" if res.get("sent") else "failed",
+                 ip=_client_ip(request), user_agent=request.headers.get("user-agent", ""))
+    return res
 
 
 @app.get("/api/admin/audit-logs")

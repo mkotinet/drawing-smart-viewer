@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import io
 import json
@@ -28,7 +29,7 @@ import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 import pypdfium2 as pdfium
@@ -68,46 +69,66 @@ PREVIEW_W = 1600
 
 def classify_path(rel_path: Path) -> tuple[str, str]:
     parts = rel_path.parts
-    top = parts[0] if parts else "기타"
+    if not parts:
+        return ("기타 도면", "기타")
+
+    # 상위 다중 리비전 폴더 구조(예: 2_AFC_0/4_P&ID/..., 1_AFD_2026.09.11/...) 자동 인식
+    rev_prefix = ""
+    work_parts = parts
+    if len(parts) >= 3 and any(k in parts[0].upper() for k in ("AFC", "AFD", "IFC", "REV", "R0", "R1", "R2")):
+        rev_prefix = parts[0]
+        work_parts = parts[1:]
+
+    top = work_parts[0]
     top_upper = top.upper()
+    full_upper = "/".join(parts).upper()
     name = rel_path.stem.upper()
+
+    def _fmt(cat: str, sub: str) -> tuple[str, str]:
+        if rev_prefix and rev_prefix not in sub:
+            return (cat, f"{rev_prefix} · {sub}")
+        return (cat, sub)
 
     if "P&ID" in top_upper or "P&ID" in name or "PID" in top_upper:
         if "UT" in name:
-            return ("P&ID", "UT공정 P&ID")
-        if len(parts) > 2:
-            return ("P&ID", parts[1])
-        return ("P&ID", "공정 P&ID")
+            return _fmt("P&ID", "UT공정 P&ID")
+        if "GREEN" in name or "그린" in rel_path.name:
+            return _fmt("P&ID", "그린공정 P&ID")
+        if len(work_parts) > 2:
+            return _fmt("P&ID", work_parts[1])
+        return _fmt("P&ID", "공정 P&ID")
 
     if "SHOP" in top_upper:
-        sub = parts[1] if len(parts) > 2 else "SHOP 기타"
-        return ("SHOP 시공도", sub)
+        sub = work_parts[1] if len(work_parts) > 2 else "SHOP 기타"
+        return _fmt("SHOP 시공도", sub)
 
     if "전력" in top or "POWER" in top_upper:
         if "DATASHEET" in name:
-            return ("전력제어", "데이터시트")
+            return _fmt("전력제어", "데이터시트")
         if "-SYS-" in name:
-            return ("전력제어", "계통도(SYS)")
+            return _fmt("전력제어", "계통도(SYS)")
         if "-WRP-" in name:
-            return ("전력제어", "배선도(WRP)")
+            return _fmt("전력제어", "배선도(WRP)")
         if "-EQP-" in name or "-MCW-" in name:
-            return ("전력제어", "배치·주전원")
-        return ("전력제어", "범례·기타")
+            return _fmt("전력제어", "배치·주전원")
+        return _fmt("전력제어", "범례·기타")
 
-    if "제어" in top or "CONTROL" in top_upper or "AFC" in top_upper:
+    if "제어" in top or "CONTROL" in top_upper or "AFC" in top_upper or "AFD" in top_upper or "GREEN" in full_upper:
         if "-HCD-" in name:
-            return ("제어 도면", "계기 결선도(HCD)")
+            return _fmt("제어 도면", "계기 결선도(HCD)")
         if "-WRP-" in name:
-            return ("제어 도면", "배선 평면도(WRP)")
+            return _fmt("제어 도면", "배선 평면도(WRP)")
         if "-EQP-" in name:
-            return ("제어 도면", "장비 배치도(EQP)")
+            return _fmt("제어 도면", "장비 배치도(EQP)")
         if "-APP-" in name:
-            return ("제어 도면", "부속 도면(APP)")
+            return _fmt("제어 도면", "부속 도면(APP)")
         if "-MCW-" in name:
-            return ("제어 도면", "주전원 결선(MCW)")
-        return ("제어 도면", "단위 설비 결선")
+            return _fmt("제어 도면", "주전원 결선(MCW)")
+        if "GREEN" in full_upper or "그린" in top:
+            return _fmt("제어 도면", "그린동 제어")
+        return _fmt("제어 도면", "단위 설비 결선")
 
-    return ("기타 도면", top)
+    return _fmt("기타 도면", top)
 
 
 def safe_sheet_id(stem: str, page_no: int, total_pages: int, sha8: str) -> str:
@@ -117,7 +138,7 @@ def safe_sheet_id(stem: str, page_no: int, total_pages: int, sha8: str) -> str:
     if len(clean) > 64:
         clean = clean[:55] + "_" + sha8
     if total_pages > 1:
-        return f"{clean}_p{page_no:03d}"
+        return f"{clean}_{sha8[:6]}_p{page_no:03d}"
     return f"{clean}_{sha8[:6]}"
 
 
@@ -531,6 +552,321 @@ def build_index(input_dir: Path, out_dir: Path, workers: int, project_name: str 
     print(f"[4/4] 로컬 인덱싱·타일링 완료 ({elapsed:.1f}s) — 시트 {len(all_sheets)}장, 태그 {total_tags}건, DB {db_mb:.2f}MB, 실패 {len(failed)}건")
 
 
+def _load_existing_by_sha(db_path: Path, out_dir: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    """기존 drawings.db에서 sha256별 시트·태그 목록을 읽어 재사용 가능한 항목만 반환."""
+    if not db_path.is_file():
+        return {}, {}
+    conn = sqlite3.connect(db_path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta").fetchall()}
+        sheet_rows = [dict(r) for r in conn.execute("SELECT * FROM sheets").fetchall()]
+        tags_by_sheet: dict[str, list[dict[str, Any]]] = {}
+        for tr in conn.execute(
+            "SELECT sheet_id, tag, kind, func, unit, loop, x0, y0, x1, y1, confidence, source, raw_text FROM tags"
+        ).fetchall():
+            d = dict(tr)
+            tags_by_sheet.setdefault(d.pop("sheet_id"), []).append(d)
+    except sqlite3.Error:
+        return {}, {}
+    finally:
+        conn.close()
+
+    by_sha: dict[str, list[dict[str, Any]]] = {}
+    for s in sheet_rows:
+        s["tags"] = tags_by_sheet.get(s["sheet_id"], [])
+        by_sha.setdefault(s["sha256"], []).append(s)
+
+    # 디스크에 썸네일·프리뷰가 실제로 남아 있는 sha256만 재사용 가능으로 인정
+    valid: dict[str, list[dict[str, Any]]] = {}
+    for sha, slist in by_sha.items():
+        ok = True
+        for s in slist:
+            sid = s["sheet_id"]
+            if not (out_dir / "thumbs" / f"{sid}.webp").is_file():
+                ok = False
+                break
+            if not (out_dir / "tiles" / sid / "preview.webp").is_file():
+                ok = False
+                break
+        if ok:
+            slist.sort(key=lambda x: x["page_no"])
+            valid[sha] = slist
+    return valid, meta
+
+
+def _write_drawings_db_atomic(
+    out_dir: Path,
+    all_sheets: list[dict[str, Any]],
+    meta: dict[str, str],
+) -> tuple[int, int]:
+    """임시 DB(.drawings.db.staging)에 전체 시트·FTS5를 기록한 뒤 drawings.db로 원자 교체."""
+    staging = out_dir / ".drawings.db.staging"
+    for suffix in ("", "-wal", "-shm"):
+        (out_dir / f".drawings.db.staging{suffix}").unlink(missing_ok=True)
+    init_drawings_db(staging)
+
+    conn = sqlite3.connect(staging, timeout=30)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=OFF")
+    seen_ids: set[str] = set()
+    total_tags = 0
+    unique_tags_set: set[str] = set()
+
+    for s in all_sheets:
+        sid = s["sheet_id"]
+        if sid in seen_ids:
+            n = 2
+            while f"{sid}_{n}" in seen_ids:
+                n += 1
+            sid = f"{sid}_{n}"
+            s["sheet_id"] = sid
+        seen_ids.add(sid)
+
+        tags = s.get("tags", [])
+        total_tags += len(tags)
+        for t in tags:
+            unique_tags_set.add(t["tag"])
+        tags_joined = " ".join(sorted({t["tag"] for t in tags}))
+
+        conn.execute(
+            """
+            INSERT INTO sheets(
+                sheet_id, category, subcategory, drawing_no, title, source_file, file_type,
+                page_no, total_pages, width_px, height_px, tile_cols, tile_rows, tile_size,
+                sha256, has_pdf, has_preview, tag_count, extra_categories, full_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sid, s["category"], s["subcategory"], s["drawing_no"], s["title"],
+                s["source_file"], s["file_type"], s["page_no"], s["total_pages"],
+                s["width_px"], s["height_px"], s["tile_cols"], s["tile_rows"], s["tile_size"],
+                s["sha256"], s["has_pdf"], s["has_preview"], len(tags),
+                s.get("extra_categories", ""), s.get("full_text", ""),
+            ),
+        )
+        if tags:
+            conn.executemany(
+                """
+                INSERT INTO tags(
+                    sheet_id, tag, kind, func, unit, loop, x0, y0, x1, y1, confidence, source, raw_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (sid, t["tag"], t["kind"], t["func"], t["unit"], t["loop"],
+                     t["x0"], t["y0"], t["x1"], t["y1"], t["confidence"], t["source"], t["raw_text"])
+                    for t in tags
+                ],
+            )
+        conn.execute(
+            "INSERT INTO sheets_fts(sheet_id, drawing_no, title, category, subcategory, tags_joined, full_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sid, s["drawing_no"] or "", s["title"], s["category"], s["subcategory"],
+             tags_joined, s.get("full_text", "")),
+        )
+
+    meta["total_sheets"] = str(len(all_sheets))
+    meta["total_tags"] = str(total_tags)
+    conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", list(meta.items()))
+    conn.execute("INSERT INTO sheets_fts(sheets_fts) VALUES('optimize')")
+    conn.commit()
+    conn.execute("VACUUM")
+    conn.close()
+
+    for suffix in ("-wal", "-shm"):
+        (out_dir / f"drawings.db{suffix}").unlink(missing_ok=True)
+    staging.replace(out_dir / "drawings.db")
+    return total_tags, len(unique_tags_set)
+
+
+def build_index_incremental(
+    input_dir: Path,
+    out_dir: Path,
+    workers: int = 1,
+    project_name: str = "도면 프로젝트",
+    batch_commit: int = 20,
+    sheet_sleep: float = 0.0,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """SHA-256 비교 기반 증분 인덱싱·타일링 (DS920+ 무인 자동 동기화용).
+
+    - 이미 인덱싱된 동일 SHA-256 PDF는 렌더링을 100% 생략하고 기존 타일/태그를 재사용한다.
+    - 신규/수정된 PDF만 저부하(workers=1 기본, 배치 체크포인트 커밋)로 렌더링·타일링한다.
+    - 구글 드라이브에서 삭제된 PDF의 시트·고아 타일·썸네일·분할 PDF를 자동 정리한다.
+    """
+    started = time.perf_counter()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    db_path = out_dir / "drawings.db"
+
+    pdfs = sorted(p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf")
+    by_hash: dict[str, dict[str, Any]] = {}
+    revisions_set: set[str] = set()
+    for p in pdfs:
+        rel = p.relative_to(input_dir)
+        if len(rel.parts) >= 2:
+            revisions_set.add(rel.parts[0])
+        cat, sub = classify_path(rel)
+        digest = sha256_file(p)
+        if digest not in by_hash:
+            by_hash[digest] = {
+                "pdf_path": str(p),
+                "rel_str": str(rel),
+                "category": cat,
+                "subcategory": sub,
+                "sha256": digest,
+                "out_dir": str(out_dir),
+                "extra_categories": [],
+            }
+        else:
+            entry = by_hash[digest]
+            label = f"{cat}/{sub}"
+            if label not in entry["extra_categories"]:
+                entry["extra_categories"].append(label)
+
+    for entry in by_hash.values():
+        entry["extra_categories"] = ", ".join(entry["extra_categories"])
+
+    existing_by_sha, existing_meta = _load_existing_by_sha(db_path, out_dir)
+    effective_project = project_name if project_name != "도면 프로젝트" else existing_meta.get("project", project_name)
+
+    reused_sheets: list[dict[str, Any]] = []
+    new_jobs: list[dict[str, Any]] = []
+    meta_changed = False
+
+    for sha, entry in by_hash.items():
+        if sha in existing_by_sha:
+            for s in existing_by_sha[sha]:
+                if (
+                    s["category"] != entry["category"]
+                    or s["subcategory"] != entry["subcategory"]
+                    or s["source_file"] != entry["rel_str"]
+                    or s.get("extra_categories", "") != entry["extra_categories"]
+                ):
+                    meta_changed = True
+                    s["category"] = entry["category"]
+                    s["subcategory"] = entry["subcategory"]
+                    s["source_file"] = entry["rel_str"]
+                    s["extra_categories"] = entry["extra_categories"]
+                reused_sheets.append(s)
+        else:
+            new_jobs.append(entry)
+
+    removed_shas = [sha for sha in existing_by_sha if sha not in by_hash]
+    removed_sheets = [s for sha in removed_shas for s in existing_by_sha[sha]]
+
+    if not new_jobs and not removed_shas and not meta_changed and db_path.is_file():
+        elapsed = round(time.perf_counter() - started, 2)
+        return {
+            "status": "no_changes",
+            "at_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+            "source_pdfs": len(pdfs),
+            "unique_pdfs": len(by_hash),
+            "added_pdfs": 0,
+            "removed_pdfs": 0,
+            "added_sheets": 0,
+            "removed_sheets": 0,
+            "failed_count": 0,
+            "total_sheets": len(reused_sheets),
+            "total_tags": sum(len(s.get("tags", [])) for s in reused_sheets),
+            "unique_tags": len({t["tag"] for s in reused_sheets for t in s.get("tags", [])}),
+            "elapsed_sec": elapsed,
+            "added_files": [],
+            "removed_files": [],
+            "revisions": sorted(revisions_set),
+        }
+
+    added_sheets: list[dict[str, Any]] = []
+    added_files: list[str] = []
+    failed: list[str] = []
+
+    def _emit_progress(done_n: int) -> None:
+        if progress_cb:
+            progress_cb({
+                "processed_pdfs": done_n,
+                "pending_pdfs": len(new_jobs),
+                "added_sheets_so_far": len(added_sheets),
+                "failed_so_far": len(failed),
+            })
+
+    def _checkpoint() -> tuple[int, int]:
+        meta = {
+            "project": effective_project,
+            "built_at_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+            "source_pdfs": str(len(pdfs)),
+            "unique_pdfs": str(len(by_hash)),
+            "failed_count": str(len(failed)),
+        }
+        return _write_drawings_db_atomic(out_dir, reused_sheets + added_sheets, meta)
+
+    _emit_progress(0)
+    if workers <= 1:
+        # DS920+ 512MB RAM 캡 보호: 프로세스 fork 없이 단일 프로세스에서 순차 처리 + GC
+        for idx, job in enumerate(new_jobs, 1):
+            try:
+                sheets = process_single_pdf(job)
+                added_sheets.extend(sheets)
+                added_files.append(job["rel_str"])
+            except Exception as exc:
+                failed.append(f"{job['rel_str']}: {exc}")
+                print(f"  [경고] 증분 건너뜀: {job['rel_str']} — {exc}")
+            gc.collect()
+            _emit_progress(idx)
+            if batch_commit > 0 and idx % batch_commit == 0 and idx < len(new_jobs):
+                _checkpoint()
+            if sheet_sleep > 0:
+                time.sleep(sheet_sleep)
+    else:
+        done = 0
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(process_single_pdf, j): j for j in new_jobs}
+            for fut in as_completed(futs):
+                job = futs[fut]
+                done += 1
+                try:
+                    sheets = fut.result()
+                    added_sheets.extend(sheets)
+                    added_files.append(job["rel_str"])
+                except Exception as exc:
+                    failed.append(f"{job['rel_str']}: {exc}")
+                    print(f"  [경고] 증분 건너뜀: {job['rel_str']} — {exc}")
+                _emit_progress(done)
+
+    total_tags, unique_tags = _checkpoint()
+
+    # 최종 원자 교체 완료 후 삭제된 시트의 고아 파일 안전 정리
+    active_ids = {s["sheet_id"] for s in (reused_sheets + added_sheets)}
+    removed_files = sorted({s["source_file"] for s in removed_sheets})
+    for rs in removed_sheets:
+        sid = rs["sheet_id"]
+        if sid in active_ids:
+            continue
+        (out_dir / "thumbs" / f"{sid}.webp").unlink(missing_ok=True)
+        shutil.rmtree(out_dir / "tiles" / sid, ignore_errors=True)
+        (out_dir / "pdfs" / f"{sid}.pdf").unlink(missing_ok=True)
+
+    elapsed = round(time.perf_counter() - started, 2)
+    status = "updated" if (added_files or removed_shas or meta_changed) else "no_changes"
+    return {
+        "status": status,
+        "at_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+        "source_pdfs": len(pdfs),
+        "unique_pdfs": len(by_hash),
+        "added_pdfs": len(added_files),
+        "removed_pdfs": len(removed_shas),
+        "added_sheets": len(added_sheets),
+        "removed_sheets": len(removed_sheets),
+        "failed_count": len(failed),
+        "failed_samples": failed[:10],
+        "total_sheets": len(reused_sheets) + len(added_sheets),
+        "total_tags": total_tags,
+        "unique_tags": unique_tags,
+        "elapsed_sec": elapsed,
+        "added_files": added_files[:30],
+        "removed_files": removed_files[:30],
+        "revisions": sorted(revisions_set),
+    }
+
+
 def _upload_tar_bytes(url: str, token: str, payload: bytes, name: str) -> dict[str, Any]:
     boundary = "----DrawingSyncBoundary98765"
     body = (
@@ -607,6 +943,7 @@ def main() -> int:
     ap.add_argument("--out", default=str(ROOT / "data"))
     ap.add_argument("--project", default="도면 프로젝트", help="인덱스 메타데이터 프로젝트명")
     ap.add_argument("--workers", type=int, default=max(2, (os.cpu_count() or 4) - 2))
+    ap.add_argument("--incremental", action="store_true", help="기존 DB와 SHA-256 비교하여 변경분만 증분 인덱싱")
     ap.add_argument("--sync-only", action="store_true")
     ap.add_argument("--url", help="동기화 대상 서버 URL (예: https://drawing.example.com)")
     ap.add_argument("--token", default=os.environ.get("SYNC_TOKEN", ""))
@@ -615,7 +952,11 @@ def main() -> int:
 
     out_dir = Path(args.out)
     if not args.sync_only:
-        build_index(Path(args.input), out_dir, args.workers, project_name=args.project)
+        if args.incremental:
+            summary = build_index_incremental(Path(args.input), out_dir, workers=args.workers, project_name=args.project)
+            print(json.dumps(summary, ensure_ascii=False))
+        else:
+            build_index(Path(args.input), out_dir, args.workers, project_name=args.project)
     if args.url:
         if not args.token:
             print("오류: --token 또는 SYNC_TOKEN 환경변수가 필요합니다", file=sys.stderr)
