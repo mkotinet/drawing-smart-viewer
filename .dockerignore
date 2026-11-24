@@ -1,0 +1,16 @@
+raw_drawings/
+data/
+dist/
+.git/
+.venv/
+.env
+tests/
+scripts/
+**/__pycache__/
+graphify-out/
+*.pdf
+*.dwg
+*.dxf
+*.xlsx
+*.db
+*.tar.gz

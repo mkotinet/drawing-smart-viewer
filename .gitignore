@@ -1,0 +1,26 @@
+# 절대 커밋 금지: 실제 도면, 인덱스 DB, 렌더 타일, 시크릿
+raw_drawings/
+data/
+dist/
+*.pdf
+*.PDF
+*.dwg
+*.DWG
+*.dxf
+*.DXF
+*.xlsx
+*.xls
+*.webp
+*.db
+*.db-wal
+*.db-shm
+*.tar.gz
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+graphify-out/
+.DS_Store
+desktop.ini
+!frontend/static/icons/*.png

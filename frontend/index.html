@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="도면 뷰어" />
+  <title>도면 스마트 뷰어</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png" />
+  <link rel="stylesheet" href="/static/style.css?v=1.0.0" />
+</head>
+<body>
+  <!-- 로그인 화면 (미인증 시 표시) -->
+  <main id="authScreen" class="auth-screen" hidden>
+    <section class="auth-panel" aria-labelledby="authTitle">
+      <div class="auth-brand">
+        <svg class="brand-mark" viewBox="0 0 36 36" width="36" height="36" aria-hidden="true">
+          <rect x="3" y="3" width="30" height="30" rx="6" fill="none" stroke="currentColor" stroke-width="2" />
+          <line x1="7" y1="18" x2="12" y2="18" stroke="#10b981" stroke-width="2.2" />
+          <line x1="24" y1="18" x2="29" y2="18" stroke="#10b981" stroke-width="2.2" />
+          <circle cx="18" cy="18" r="6" fill="none" stroke="currentColor" stroke-width="2" />
+          <line x1="12.5" y1="18" x2="23.5" y2="18" stroke="currentColor" stroke-width="1.6" />
+        </svg>
+        <div>
+          <h1 id="authTitle">도면 스마트 뷰어</h1>
+          <p class="auth-sub">P&amp;ID · CAD · 시공도 로컬 보안 열람 시스템</p>
+        </div>
+      </div>
+
+      <form id="loginForm" class="auth-form" autocomplete="on">
+        <div class="field">
+          <label for="loginUser">계정 아이디</label>
+          <input id="loginUser" name="username" type="text" required autocomplete="username" placeholder="아이디 입력" />
+        </div>
+        <div class="field">
+          <label for="loginPass">비밀번호</label>
+          <input id="loginPass" name="password" type="password" required autocomplete="current-password" placeholder="비밀번호 입력" />
+        </div>
+        <p id="loginError" class="form-error" role="alert" aria-live="polite"></p>
+        <button id="loginSubmit" type="submit" class="btn btn-primary btn-full">로그인</button>
+      </form>
+      <p class="auth-foot">사내 승인 계정 전용 · 모든 열람·다운로드 이력이 KST 기준으로 기록됩니다.</p>
+    </section>
+  </main>
+
+  <!-- 메인 엔지니어링 워크벤치 -->
+  <div id="appShell" class="app-shell" hidden>
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="btnToggleSidebar" type="button" class="icon-btn" aria-label="도면 목록 열기/닫기" title="도면 목록">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div class="topbar-title">
+          <span id="appProjectName" class="app-name">도면 스마트 뷰어</span>
+          <span id="statBadge" class="stat-pill">로딩 중</span>
+        </div>
+      </div>
+
+      <form id="globalSearchForm" class="search-bar" role="search">
+        <svg class="search-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="globalSearchInput" type="search" placeholder="계기 태그(TE, TIC), 도면번호(HCD-0001), 키워드 검색..." aria-label="도면 및 태그 검색" />
+        <button id="btnClearSearch" type="button" class="search-clear" aria-label="검색어 지우기" hidden>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </form>
+
+      <div class="topbar-right">
+        <button id="btnInstallPwa" type="button" class="btn btn-ghost btn-sm" hidden>앱 설치</button>
+        <button id="btnToggleTheme" type="button" class="icon-btn" aria-label="밝기 테마 전환" title="다크/라이트 전환">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        </button>
+        <button id="btnAuditLog" type="button" class="icon-btn" aria-label="감사 로그" title="관리자 감사 로그" hidden>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </button>
+        <button id="btnAccount" type="button" class="user-chip" title="계정 및 세션">
+          <span id="userDisplay">-</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <!-- 좌측 탐색기 (도면 / 태그 / 즐겨찾기) -->
+      <aside id="sidebar" class="sidebar" aria-label="도면 탐색기">
+        <div class="sidebar-tabs" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="drawings" role="tab" aria-selected="true">도면 목록</button>
+          <button type="button" class="tab-btn" data-tab="tags" role="tab" aria-selected="false">계기 태그</button>
+          <button type="button" class="tab-btn" data-tab="favorites" role="tab" aria-selected="false">즐겨찾기</button>
+        </div>
+
+        <div id="categoryStrip" class="category-strip" aria-label="공종 필터"></div>
+        <div id="subCategoryStrip" class="subcat-strip" hidden></div>
+
+        <div id="listMeta" class="list-meta"></div>
+        <div id="listContainer" class="list-container" role="region" aria-live="polite"></div>
+        <div id="listPager" class="list-pager" hidden>
+          <button id="btnPrevPage" type="button" class="btn btn-ghost btn-sm">이전</button>
+          <span id="pagerInfo" class="pager-info">1 / 1</span>
+          <button id="btnNextPage" type="button" class="btn btn-ghost btn-sm">다음</button>
+        </div>
+      </aside>
+
+      <!-- 중앙 도면 캔버스 -->
+      <section class="viewer-stage" aria-label="도면 뷰어">
+        <div id="viewerHeader" class="viewer-header" hidden>
+          <div class="viewer-doc-info">
+            <span id="docCatBadge" class="badge">-</span>
+            <h2 id="docTitle" class="doc-title">도면을 선택하세요</h2>
+            <span id="docSub" class="doc-sub"></span>
+          </div>
+          <div class="viewer-actions">
+            <div id="siblingNav" class="sibling-nav" hidden>
+              <button id="btnSibPrev" type="button" class="icon-btn-sm" aria-label="이전 페이지" title="이전 페이지">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>
+              </button>
+              <span id="siblingLabel" class="sibling-label">1 / 1</span>
+              <button id="btnSibNext" type="button" class="icon-btn-sm" aria-label="다음 페이지" title="다음 페이지">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>
+              </button>
+            </div>
+            <button id="btnFavorite" type="button" class="icon-btn-sm" aria-label="즐겨찾기" title="즐겨찾기">
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            </button>
+            <button id="btnToggleOverlay" type="button" class="btn btn-ghost btn-sm active" title="태그 박스 표시">태그 박스</button>
+            <button id="btnInvertColors" type="button" class="btn btn-ghost btn-sm" title="야간 현장용 반전 모드">반전</button>
+            <a id="btnDownloadPdf" class="btn btn-ghost btn-sm" target="_blank" rel="noopener" hidden>PDF</a>
+            <button id="btnToggleInspector" type="button" class="btn btn-primary btn-sm">태그 <span id="sheetTagCount">0</span></button>
+          </div>
+        </div>
+
+        <div id="canvasViewport" class="canvas-viewport">
+          <div id="emptyState" class="empty-state">
+            <svg viewBox="0 0 64 64" width="52" height="52" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+              <rect x="8" y="10" width="48" height="44" rx="4"/>
+              <path d="M8 20h48M22 20v34"/>
+              <circle cx="39" cy="36" r="8"/>
+              <path d="M31 36h16M47 36h5M27 36h4"/>
+            </svg>
+            <h2>도면 또는 계기 태그를 선택하세요</h2>
+            <p>상단 검색창에 태그(예: <code>TE</code>, <code>TIC</code>, <code>HCD-0001</code>)를 입력하면 P&amp;ID · 결선도 · 배선도 · 시공도를 즉시 교차 탐색합니다.</p>
+          </div>
+
+          <div id="canvasLoading" class="canvas-loading" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <span>도면 불러오는 중...</span>
+          </div>
+
+          <div id="stageLayer" class="stage-layer" hidden>
+            <img id="previewImg" class="preview-img" alt="도면 이미지" draggable="false" />
+            <div id="tileGrid" class="tile-grid"></div>
+            <div id="overlayLayer" class="overlay-layer"></div>
+          </div>
+
+          <div id="zoomControls" class="zoom-controls" hidden>
+            <button id="btnZoomOut" type="button" class="zoom-btn" aria-label="축소" title="축소 (-)">−</button>
+            <button id="btnZoomFit" type="button" class="zoom-pct" title="화면에 맞추기 (0)">100%</button>
+            <button id="btnZoomIn" type="button" class="zoom-btn" aria-label="확대" title="확대 (+)">+</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 우측 / 모바일 하단 태그 & 교차 도면 인스펙터 -->
+      <aside id="inspector" class="inspector" aria-label="시트 태그 및 교차 참조" hidden>
+        <div class="inspector-head">
+          <h3 id="inspectorTitle">시트 내 태그</h3>
+          <button id="btnCloseInspector" type="button" class="icon-btn-sm" aria-label="인스펙터 닫기">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="inspector-filter">
+          <input id="inspectorSearch" type="search" placeholder="이 도면 내 태그 필터..." aria-label="현재 도면 태그 필터" />
+        </div>
+        <div id="crossRefBox" class="cross-ref-box" hidden></div>
+        <div id="inspectorList" class="inspector-list"></div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- 계정 / 세션 다이얼로그 (Native <dialog>, modern-web-guidance 준수) -->
+  <dialog id="accountDialog" closedby="any" aria-labelledby="accountDialogTitle">
+    <div class="dialog-head">
+      <h1 id="accountDialogTitle">계정 및 앱 정보</h1>
+      <button type="button" class="icon-btn-sm" data-close-dialog aria-label="닫기">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div id="accountBody" class="dialog-body"></div>
+    <div class="dialog-foot">
+      <button id="btnLogout" type="button" class="btn btn-danger">로그아웃</button>
+      <button type="button" class="btn btn-ghost" data-close-dialog>닫기</button>
+    </div>
+  </dialog>
+
+  <!-- 관리자 감사 로그 다이얼로그 -->
+  <dialog id="auditDialog" class="dialog-wide" closedby="any" aria-labelledby="auditDialogTitle">
+    <div class="dialog-head">
+      <h1 id="auditDialogTitle">보안 감사 로그 (KST)</h1>
+      <button type="button" class="icon-btn-sm" data-close-dialog aria-label="닫기">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div id="auditBody" class="dialog-body audit-body"></div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-ghost" data-close-dialog>닫기</button>
+    </div>
+  </dialog>
+
+  <!-- PWA 설치 안내 다이얼로그 -->
+  <dialog id="pwaDialog" closedby="any" aria-labelledby="pwaDialogTitle">
+    <div class="dialog-head">
+      <h1 id="pwaDialogTitle">모바일 홈 화면에 앱 설치</h1>
+      <button type="button" class="icon-btn-sm" data-close-dialog aria-label="닫기">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="dialog-body">
+      <p>홈 화면에 추가하면 현장에서도 전체 화면으로 빠르게 도면을 열람하고, 최근 조회한 도면을 오프라인으로 확인할 수 있습니다.</p>
+      <ul class="guide-list">
+        <li><strong>Android Chrome</strong>: 우측 상단 메뉴(⋮) → <strong>앱 설치</strong> 또는 <strong>홈 화면에 추가</strong></li>
+        <li><strong>iOS Safari</strong>: 하단 공유 버튼 → <strong>홈 화면에 추가</strong></li>
+      </ul>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-primary" data-close-dialog>확인</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/static/app.js?v=1.0.0" defer></script>
+</body>
+</html>
