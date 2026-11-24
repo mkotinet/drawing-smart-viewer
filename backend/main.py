@@ -637,6 +637,15 @@ def list_audit_logs(limit: int = Query(default=100, ge=1, le=500),
     return {"items": [dict(r) for r in rows]}
 
 
+@app.get("/api/admin/users")
+def list_users(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with state_conn() as conn:
+        rows = conn.execute(
+            "SELECT username, role, created_at FROM users ORDER BY role, username"
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
 @app.post("/api/admin/users")
 def create_user(body: UserCreateBody, request: Request,
                 admin: dict[str, Any] = Depends(require_admin)) -> dict[str, str]:
@@ -650,6 +659,21 @@ def create_user(body: UserCreateBody, request: Request,
         )
     record_audit(admin["username"], "create_user", target=uname, ip=_client_ip(request), detail=body.role)
     return {"status": "ok", "username": uname, "role": body.role}
+
+
+@app.delete("/api/admin/users/{username}")
+def delete_user(username: str, request: Request,
+                admin: dict[str, Any] = Depends(require_admin)) -> dict[str, str]:
+    uname = username.strip()
+    if uname == admin["username"]:
+        raise HTTPException(status_code=400, detail="현재 로그인한 최고관리자 계정은 삭제할 수 없습니다")
+    with state_conn() as conn:
+        cur = conn.execute("DELETE FROM users WHERE username = ?", (uname,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="계정을 찾을 수 없습니다")
+        conn.execute("DELETE FROM sessions WHERE username = ?", (uname,))
+    record_audit(admin["username"], "delete_user", target=uname, ip=_client_ip(request))
+    return {"status": "ok", "deleted": uname}
 
 
 # ── 정적 자산 & SPA 엔트리 ──────────────────────────────────────────────────

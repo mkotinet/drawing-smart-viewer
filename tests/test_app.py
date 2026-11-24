@@ -122,3 +122,22 @@ def test_sync_upload_rejects_path_traversal_and_serves_indexed_drawings(client, 
     tile_resp = c.get("/api/sheets/HCD_001/preview.webp", headers=hdr)
     assert tile_resp.status_code == 200
     assert "immutable" in tile_resp.headers["cache-control"]
+
+
+def test_admin_env_password_sync_and_user_management(client, monkeypatch):
+    c, _ = client
+    # 환경변수 비밀번호 변경 후 재초기화 시 기존 관리자 비밀번호 자동 동기화
+    monkeypatch.setenv("ADMIN_PASSWORD", "rotatedPass99!")
+    init_state_db()
+    assert c.post("/api/auth/login", json={"username": "admin", "password": "testpass123"}).status_code == 401
+    r = c.post("/api/auth/login", json={"username": "admin", "password": "rotatedPass99!"})
+    assert r.status_code == 200
+    hdr = {"Authorization": f"Bearer {r.json()['token']}"}
+
+    # 계정 생성 · 조회 · 본인 삭제 차단 · 타 계정 삭제 검증
+    assert c.post("/api/admin/users", json={"username": "eng1", "password": "user1234", "role": "engineer"}, headers=hdr).status_code == 200
+    users = [u["username"] for u in c.get("/api/admin/users", headers=hdr).json()["items"]]
+    assert "admin" in users and "eng1" in users
+    assert c.delete("/api/admin/users/admin", headers=hdr).status_code == 400
+    assert c.delete("/api/admin/users/eng1", headers=hdr).status_code == 200
+    assert c.post("/api/auth/login", json={"username": "eng1", "password": "user1234"}).status_code == 401

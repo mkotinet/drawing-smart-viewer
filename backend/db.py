@@ -200,11 +200,19 @@ def init_state_db() -> None:
         admin_user = get_admin_user()
         admin_pw = get_admin_password()
         if admin_pw:
-            row = conn.execute("SELECT username FROM users WHERE username = ?", (admin_user,)).fetchone()
+            row = conn.execute(
+                "SELECT username, password_hash, role FROM users WHERE username = ?",
+                (admin_user,),
+            ).fetchone()
             if row is None:
                 conn.execute(
                     "INSERT INTO users(username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
                     (admin_user, hash_password(admin_pw), now_kst_iso()),
+                )
+            elif row["role"] != "admin" or not verify_password(admin_pw, row["password_hash"]):
+                conn.execute(
+                    "UPDATE users SET password_hash = ?, role = 'admin' WHERE username = ?",
+                    (hash_password(admin_pw), admin_user),
                 )
 
 
