@@ -6,7 +6,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.3.1';
+  const APP_VERSION = '1.4.0';
   const USER_KEY = 'dsv_auth_user';
   const THEME_KEY = 'dsv_theme';
   const TILE_CACHE_NAME = 'dsv-tiles-v1.0.0';

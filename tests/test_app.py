@@ -642,3 +642,132 @@ def test_v131_mass_delete_safety_guard_and_mobile_sidebar_css(tmp_path):
     assert "overscroll-behavior: contain;" in mobile_section
     assert "position: sticky;" in mobile_section
     assert "overflow-y: visible;" in mobile_section
+
+
+def test_v140_hybrid_gate_rotated_split_safe_global_snap_cache_and_row_text(tmp_path):
+    from scripts.build_index import (
+        _load_ocr_cache,
+        _save_ocr_cache,
+        normalize_ocr_tail_digits,
+        reconstruct_row_text,
+        snap_global_ocr_tags,
+    )
+    from scripts.ocr_engine import (
+        _expand_ocr_words,
+        merge_digital_and_ocr_words,
+        needs_body_ocr,
+    )
+
+    # 1) 2중 게이트 본문 전용 OCR 판별: 표제란만 디지털 + 벡터 선분 다수 → True / 단순 디지털 표지 → False
+    class _FakeObj:
+        def __init__(self, t, bounds=(0, 0, 10, 10)):
+            self.type = t
+            self._b = bounds
+
+        def get_bounds(self):
+            return self._b
+
+    class _FakePage:
+        def __init__(self, n_paths=0, img_bounds=None):
+            self._objs = [_FakeObj(2) for _ in range(n_paths)]
+            if img_bounds:
+                self._objs.append(_FakeObj(3, img_bounds))
+
+        def get_size(self):
+            return (1000.0, 800.0)
+
+        def get_objects(self):
+            return iter(self._objs)
+
+    tb_text = "REV DATE DESCRIPTION DRN CHK APP PM 장태영 방종철 전영민 김성훈 박기철 HOOK-UP DRAWING SF7544-EK0L"
+    tb_words = [
+        {"text": tok, "x0": 0.60, "y0": 0.80, "x1": 0.70, "y1": 0.82}
+        for tok in tb_text.split()
+    ]
+    assert needs_body_ocr(_FakePage(n_paths=570), tb_words, tb_text) is True     # 숨은 SHX 본문 감지
+    assert needs_body_ocr(_FakePage(n_paths=2), tb_words, tb_text) is False      # 단순 디지털 표지 스킵
+    assert needs_body_ocr(_FakePage(n_paths=5, img_bounds=(50, 50, 850, 650)), tb_words, tb_text) is True  # 대형 스캔 이미지 감지
+    body_words = tb_words + [
+        {"text": f"TAGVAL{i:02d}", "x0": 0.1 + i * 0.03, "y0": 0.2, "x1": 0.12 + i * 0.03, "y1": 0.22}
+        for i in range(14)
+    ]
+    assert needs_body_ocr(_FakePage(n_paths=900), body_words, tb_text) is False  # 디지털 본문 충분
+
+    # 2) 세로 회전 텍스트 Y축 비례 분할 + 디지털/OCR 표제란 중복 제거
+    _, rot_words = _expand_ocr_words([{
+        "text": "550A-CWR 061213",
+        "x0": 0.20, "y0": 0.20, "x1": 0.22, "y1": 0.60,
+        "confidence": 0.96, "source": "ocr", "rotated": True,
+    }])
+    sub_toks = [w for w in rot_words if w["text"] in ("550A-CWR", "061213")]
+    assert len(sub_toks) == 2 and sub_toks[0]["y1"] < sub_toks[1]["y1"]
+
+    merged = merge_digital_and_ocr_words(
+        [{"text": "SF7544-EK0L", "x0": 0.60, "y0": 0.80, "x1": 0.75, "y1": 0.83, "source": "pdf_text"}],
+        [
+            {"text": "SF7544-EK0L", "x0": 0.60, "y0": 0.80, "x1": 0.75, "y1": 0.83, "source": "ocr"},
+            {"text": "FIT_NK2GC01", "x0": 0.20, "y0": 0.30, "x1": 0.30, "y1": 0.33, "source": "ocr"},
+        ],
+    )
+    assert len(merged) == 2 and {w["text"] for w in merged} == {"SF7544-EK0L", "FIT_NK2GC01"}
+
+    # 3) 말미 숫자 슬롯 정규화 (화학식 CO2 보호 + O1→01 교정)
+    assert normalize_ocr_tail_digits("FCV_N2GASWWO2") == "FCV_N2GASWW02"
+    assert normalize_ocr_tail_digits("AS_N2GATWO1A") == "AS_N2GATW01A"
+    assert normalize_ocr_tail_digits("AT_N2GACO2") == "AT_N2GACO2"
+
+    # 4) 전역 사전 3대 불변 제약 검증 (위험 변조 0건, 실제 시각 혼동 오타만 정밀 교정)
+    sheets = [
+        {
+            "sheet_id": "DIG_1",
+            "tags": [
+                {"tag": "DPT_N2GABWW01", "kind": "instrument", "func": "DPT", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "DPT_N2GCODOR03", "kind": "instrument", "func": "DPT", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "CWWP_NK2GB02B", "kind": "equipment", "func": "CWWP", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "CWWP_NK2GB02A", "kind": "equipment", "func": "CWWP", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "BLB_N2GD040", "kind": "equipment", "func": "BLB", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "TIC_N2USHCW32", "kind": "instrument", "func": "TIC", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "FT_NK2GIWWFRB1", "kind": "instrument", "func": "FT", "source": "pdf_text", "confidence": 1.0},
+                {"tag": "HS_SMP_N2GA0101B", "kind": "instrument", "func": "HS", "source": "pdf_text", "confidence": 1.0},
+            ],
+        },
+        {
+            "sheet_id": "OCR_1",
+            "tags": [
+                # 절대 변조되면 안 되는 5건 (기능문자·동/존·길이·숫자↔숫자)
+                {"tag": "DPIT_N2GABWW01", "kind": "instrument", "func": "DPIT", "source": "ocr", "confidence": 0.84, "raw_text": ""},
+                {"tag": "DPI_N2GCODOR03", "kind": "instrument", "func": "DPI", "source": "ocr", "confidence": 0.84, "raw_text": ""},
+                {"tag": "CWWP_NK2GA02B", "kind": "equipment", "func": "CWWP", "source": "ocr", "confidence": 0.84, "raw_text": ""},
+                {"tag": "BLB_N2GD04", "kind": "equipment", "func": "BLB", "source": "ocr", "confidence": 0.84, "raw_text": ""},
+                {"tag": "TIC_N2USHCW31", "kind": "instrument", "func": "TIC", "source": "ocr", "confidence": 0.84, "raw_text": ""},
+                # 반드시 교정되어야 하는 3건 (시각 혼동쌍 + O1→01)
+                {"tag": "CWNP_NK2GB02A", "kind": "equipment", "func": "CWNP", "source": "ocr", "confidence": 0.86, "raw_text": ""},
+                {"tag": "FT_MK2GIWWFRB1", "kind": "instrument", "func": "FT", "source": "ocr", "confidence": 0.82, "raw_text": ""},
+                {"tag": "HS_SMP_NUGAO101B", "kind": "instrument", "func": "HS", "source": "ocr", "confidence": 0.65, "raw_text": ""},
+            ],
+        },
+    ]
+    fixed = snap_global_ocr_tags(sheets)
+    ocr_out = [t["tag"] for t in sheets[1]["tags"]]
+    assert fixed >= 3
+    assert ocr_out[:5] == [
+        "DPIT_N2GABWW01", "DPI_N2GCODOR03", "CWWP_NK2GA02B", "BLB_N2GD04", "TIC_N2USHCW31"
+    ]
+    assert ocr_out[5:] == ["CWWP_NK2GB02A", "FT_NK2GIWWFRB1", "HS_SMP_N2GA0101B"]
+
+    # 5) 좌표 기반 Y-행 클러스터링 표 문맥 복원 + OCR JSON 캐시 라운드트립
+    tbl_words = [
+        {"text": "Tag", "x0": 0.10, "y0": 0.10, "x1": 0.14, "y1": 0.12},
+        {"text": "TE-101", "x0": 0.10, "y0": 0.15, "x1": 0.16, "y1": 0.17},
+        {"text": "Range", "x0": 0.40, "y0": 0.101, "x1": 0.46, "y1": 0.121},
+        {"text": "0~100C", "x0": 0.40, "y0": 0.151, "x1": 0.47, "y1": 0.171},
+        {"text": "Spec", "x0": 0.25, "y0": 0.10, "x1": 0.30, "y1": 0.12},
+        {"text": "PT100", "x0": 0.25, "y0": 0.15, "x1": 0.31, "y1": 0.17},
+    ]
+    row_txt = reconstruct_row_text(tbl_words)
+    assert row_txt == "Tag | Spec | Range\nTE-101 | PT100 | 0~100C"
+
+    cdir = tmp_path / "ocr_cache"
+    _save_ocr_cache(cdir, "deadbeef1234567890", 3, "HELLO", [{"text": "HELLO", "x0": 0.1, "y0": 0.1, "x1": 0.2, "y1": 0.2}])
+    loaded = _load_ocr_cache(cdir, "deadbeef1234567890", 3)
+    assert loaded is not None and loaded["text"] == "HELLO" and len(loaded["words"]) == 1

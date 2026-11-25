@@ -154,7 +154,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="도면 스마트 뷰어", version="1.3.1", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="도면 스마트 뷰어", version="1.4.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 

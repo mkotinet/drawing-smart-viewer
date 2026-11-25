@@ -253,6 +253,7 @@ def run_sync_cycle(reason: str = "scheduled", force_notify: bool = False) -> dic
             enable_ocr=ENABLE_OCR,
             ocr_subprocess=True,
             max_delete_ratio=MAX_DELETE_RATIO,
+            ocr_cache_dir=STATE_DIR / "ocr_cache",
             progress_cb=on_progress,
         )
         summary.update(rclone_info)

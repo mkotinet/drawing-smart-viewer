@@ -40,10 +40,17 @@ from pypdf import PdfReader, PdfWriter
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.db import canonicalize_tag, extract_revision, init_drawings_db  # noqa: E402
-from scripts.ocr_engine import is_ocr_available, needs_ocr, ocr_pil_image  # noqa: E402
+from scripts.ocr_engine import (  # noqa: E402
+    OCR_ENGINE_VERSION,
+    is_ocr_available,
+    merge_digital_and_ocr_words,
+    needs_body_ocr,
+    needs_ocr,
+    ocr_pil_image,
+)
 
 KST = timezone(timedelta(hours=9), "KST")
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 
 # ISA-5.1 + 공조/유틸리티/반도체 플랜트 계장 기능문자 허용 목록
 INSTRUMENT_FUNCS = frozenset("""
@@ -164,6 +171,185 @@ def snap_ocr_token(candidate: str, vocab: list[str], max_dist: float = 2.0) -> s
     if len(scored) == 1 or (scored[1][0] - scored[0][0]) >= 0.5:
         return scored[0][1]
     return None
+
+
+# 전역 사전 교정 시 허용되는 엄격한 OCR 시각 혼동 쌍 (A↔B, 숫자↔숫자 변조 원천 배제)
+_STRICT_VISUAL_CONFUSABLES = frozenset({
+    ("0", "O"), ("O", "0"), ("1", "I"), ("I", "1"), ("1", "L"), ("L", "1"),
+    ("I", "L"), ("L", "I"), ("2", "Z"), ("Z", "2"), ("2", "U"), ("U", "2"),
+    ("5", "S"), ("S", "5"), ("8", "B"), ("B", "8"), ("6", "G"), ("G", "6"),
+    ("Q", "O"), ("O", "Q"), ("Q", "C"), ("C", "Q"), ("O", "C"), ("C", "O"),
+    ("G", "C"), ("C", "G"), ("M", "N"), ("N", "M"), ("N", "W"), ("W", "N"),
+    ("M", "W"), ("W", "M"),
+})
+_RE_OCR_TAIL_O1 = re.compile(r"(?<=[A-Z0-9_])([OIl])(\d[A-Z]?)$")
+_RE_OCR_TAIL_1O = re.compile(r"(?<=\d)([OIl])([A-Z]?)$")
+_RE_CHEM_GAS_TAIL = re.compile(r"(?:CO2|NO2|SO2|H2O)$")
+_RE_ZONE_PREFIX = re.compile(r"(?:N2G|NK2G)$")
+
+
+def normalize_ocr_tail_digits(tag: str) -> str:
+    """OCR 태그 말미 숫자 슬롯의 O→0 / I,l→1 결정론적 보정 (예: FCV_N2GASWWO2 → FCV_N2GASWW02)."""
+    s = (tag or "").strip().upper()
+    if len(s) < 7 or ("_" not in s and "-" not in s) or _RE_CHEM_GAS_TAIL.search(s):
+        return s
+    s = _RE_OCR_TAIL_O1.sub(lambda m: ("0" if m.group(1) == "O" else "1") + m.group(2), s)
+    s = _RE_OCR_TAIL_1O.sub(lambda m: ("0" if m.group(1) == "O" else "1") + m.group(2), s)
+    return s
+
+
+def _split_tag_prefix(tag: str) -> tuple[str, str, str]:
+    for sep in ("_", "-"):
+        if sep in tag:
+            p, b = tag.split(sep, 1)
+            return p, sep, b
+    return "", "", tag
+
+
+def snap_global_ocr_tags(all_sheets: list[dict[str, Any]]) -> int:
+    """프로젝트 전역 디지털 확정 사전으로 OCR 오타를 3대 불변 제약 하에 안전 교정.
+
+    불변 제약 (Carbon 검증본):
+    1. 계기 기능문자(func: DPIT ≠ DPT ≠ DPI) 변경 절대 금지.
+    2. 문자열 길이 변화(04 ≠ 040), 동·존 코드(GA ≠ GB), 숫자↔숫자, 말미 트레인(A ≠ B) 변경 절대 금지.
+    3. 오직 엄격한 시각 혼동쌍 치환(<=2글자)으로 유일 일치하는 디지털 확정 태그가 있을 때만 교정.
+    """
+    digital_exact: set[str] = set()
+    by_bucket: dict[tuple[str, str, int], list[tuple[str, str, str]]] = {}
+
+    for s in all_sheets:
+        for t in s.get("tags", []):
+            if t.get("source") != "pdf_text":
+                continue
+            tg = (t.get("tag") or "").strip().upper()
+            kind = t.get("kind", "")
+            if len(tg) < 8 or kind not in ("instrument", "equipment"):
+                continue
+            pfx, sep, body = _split_tag_prefix(tg)
+            if not sep or not body:
+                continue
+            if tg not in digital_exact:
+                digital_exact.add(tg)
+                by_bucket.setdefault((kind, sep, len(tg)), []).append((tg, pfx, body))
+
+    if not digital_exact:
+        return 0
+
+    fixed_count = 0
+    for s in all_sheets:
+        for t in s.get("tags", []):
+            if t.get("source") != "ocr":
+                continue
+            kind = t.get("kind", "")
+            if kind not in ("instrument", "equipment"):
+                continue
+            orig_tag = (t.get("tag") or "").strip().upper()
+            cand = normalize_ocr_tail_digits(orig_tag)
+            if cand != orig_tag:
+                t["tag"] = cand
+                t["canonical_tag"] = canonicalize_tag(cand)
+                _, _, new_body = _split_tag_prefix(cand)
+                if new_body:
+                    t["loop"] = new_body
+                t["loop_key"] = _compute_loop_key(cand, kind, t.get("func"), t.get("unit"), t.get("loop"))
+                t["raw_text"] = f"{t.get('raw_text', orig_tag)} → {cand}"[:120]
+                fixed_count += 1
+
+            if cand in digital_exact or float(t.get("confidence", 1.0)) >= 0.92 or len(cand) < 8:
+                continue
+            pfx, sep, body = _split_tag_prefix(cand)
+            if not sep or not body:
+                continue
+
+            refs = by_bucket.get((kind, sep, len(cand)))
+            if not refs:
+                continue
+
+            matches: list[str] = []
+            for ref_tag, ref_pfx, ref_body in refs:
+                # 불변 제약 1: 계기 기능문자(DPIT/DPT/DPI)는 100% 일치 필수; 설비는 body 100% 일치 시 prefix 1글자 혼동만 허용
+                if kind == "instrument" and ref_pfx != pfx:
+                    continue
+                if kind == "equipment" and ref_pfx != pfx:
+                    if ref_body != body or len(ref_pfx) != len(pfx):
+                        continue
+
+                diffs = [i for i in range(len(cand)) if cand[i] != ref_tag[i]]
+                if not (1 <= len(diffs) <= 2):
+                    continue
+
+                valid = True
+                for i in diffs:
+                    ca, cb = cand[i], ref_tag[i]
+                    if (ca, cb) not in _STRICT_VISUAL_CONFUSABLES:
+                        valid = False
+                        break
+                    # 불변 제약 2a: 숫자 ↔ 다른 숫자 변경 금지
+                    if ca.isdigit() and cb.isdigit():
+                        valid = False
+                        break
+                    # 불변 제약 2b: 말미 트레인 문자(A/B/C 등) 변경 금지
+                    if i == len(cand) - 1 and ca.isalpha() and cb.isalpha():
+                        valid = False
+                        break
+                    # 불변 제약 2c: 동/존 코드(N2GA vs N2GB) 변경 금지
+                    if i >= 3 and _RE_ZONE_PREFIX.search(ref_tag[max(0, i - 4):i]):
+                        valid = False
+                        break
+                if valid:
+                    matches.append(ref_tag)
+                    if len(matches) > 1:
+                        break
+
+            if len(matches) == 1:
+                snapped = matches[0]
+                t["tag"] = snapped
+                t["canonical_tag"] = canonicalize_tag(snapped)
+                new_pfx, _, new_body = _split_tag_prefix(snapped)
+                if new_pfx:
+                    t["func"] = new_pfx
+                if new_body:
+                    t["loop"] = new_body
+                t["loop_key"] = _compute_loop_key(snapped, kind, t.get("func"), t.get("unit"), t.get("loop"))
+                t["raw_text"] = f"{t.get('raw_text', orig_tag)} → {snapped}"[:120]
+                fixed_count += 1
+
+    return fixed_count
+
+
+def reconstruct_row_text(words: list[dict[str, Any]], y_tol: float = 0.0065, col_gap: float = 0.022) -> str:
+    """단어 좌표(x0, y0)를 Y-행 클러스터링·X-열 정렬하여 표/데이터시트 행 단위 문맥 텍스트를 복원."""
+    if not words:
+        return ""
+    # OCR 풀라인 구문 중복 제외(개별 토큰만 사용)
+    items = [w for w in words if (w.get("text") or "").strip() and " " not in (w.get("text") or "").strip()]
+    if len(items) < 6:
+        return ""
+    items.sort(key=lambda w: ((w["y0"] + w["y1"]) / 2, w["x0"]))
+    rows: list[tuple[float, list[dict[str, Any]]]] = []
+    for w in items:
+        cy = (w["y0"] + w["y1"]) / 2
+        if rows and abs(cy - rows[-1][0]) <= y_tol:
+            rows[-1][1].append(w)
+        else:
+            rows.append((cy, [w]))
+
+    lines: list[str] = []
+    for _, row_words in rows:
+        row_words.sort(key=lambda w: w["x0"])
+        parts: list[str] = []
+        prev_x1: float | None = None
+        for rw in row_words:
+            txt = rw["text"].strip()
+            if prev_x1 is not None:
+                gap = rw["x0"] - prev_x1
+                parts.append(" | " if gap >= col_gap else " ")
+            parts.append(txt)
+            prev_x1 = max(prev_x1 or 0.0, rw["x1"])
+        line = "".join(parts).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def is_valid_tag(tag: str, kind: str, func: str | None = None,
@@ -680,14 +866,47 @@ def _run_ocr_subprocess(pdf_path: Path, page_indices: list[int], master_max_w: i
         out_json.unlink(missing_ok=True)
 
 
+def _ocr_cache_file(cache_dir: Path | None, sha256: str, page_no: int) -> Path | None:
+    if cache_dir is None:
+        return None
+    return cache_dir / f"{sha256[:16]}_p{page_no:03d}_v{OCR_ENGINE_VERSION}.json"
+
+
+def _load_ocr_cache(cache_dir: Path | None, sha256: str, page_no: int) -> dict[str, Any] | None:
+    p = _ocr_cache_file(cache_dir, sha256, page_no)
+    if p is None or not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "text" in data and isinstance(data.get("words"), list):
+            return data
+    except Exception:
+        return None
+    return None
+
+
+def _save_ocr_cache(cache_dir: Path | None, sha256: str, page_no: int, text: str, words: list[dict[str, Any]]) -> None:
+    p = _ocr_cache_file(cache_dir, sha256, page_no)
+    if p is None:
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"text": text, "words": words}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
 def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
-    """PDF 1개(단일/다중 페이지)를 렌더링·타일링·텍스트/선택적 OCR·태그·연결화살표 인덱싱."""
+    """PDF 1개(단일/다중 페이지)를 렌더링·타일링·하이브리드 OCR·400 DPI ROI·행 구조화·태그·연결화살표 인덱싱."""
     pdf_path = Path(job["pdf_path"])
     rel_str = job["rel_str"]
     category = job["category"]
     subcategory = job["subcategory"]
     sha256 = job["sha256"]
     out_dir = Path(job["out_dir"])
+    ocr_cache_dir = Path(job["ocr_cache_dir"]) if job.get("ocr_cache_dir") else None
     extra_cats = job["extra_categories"]
     enable_ocr = bool(job.get("enable_ocr", False))
     ocr_subprocess = bool(job.get("ocr_subprocess", False))
@@ -704,9 +923,10 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
     total_pages = len(doc)
     reader = PdfReader(str(pdf_path)) if (total_pages > 1 and not reparse_only) else None
 
-    # 1차 패스: 디지털 텍스트 추출 + OCR 필요 페이지 선별 (DS920+ 격리 서브프로세스용)
+    # 1차 패스: 디지털 텍스트 추출 + 2중 게이트 하이브리드 OCR 대상 선별 + OCR JSON 캐시 조회
     page_texts: list[tuple[str, list[dict[str, Any]], float, float]] = []
     shx_indices: list[int] = []
+    cached_ocr: dict[int, dict[str, Any]] = {}
     for idx in range(total_pages):
         page = doc[idx]
         pw, ph = page.get_size()
@@ -716,14 +936,20 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         ft, words = extract_page_tokens(page)
         page_texts.append((ft, words, pw, ph))
-        if needs_ocr(ft):
+        if needs_body_ocr(page, words, ft):
             shx_indices.append(idx)
+            hit = _load_ocr_cache(ocr_cache_dir, sha256, idx + 1)
+            if hit is not None:
+                cached_ocr[idx] = hit
         page.close()
 
-    ocr_available = enable_ocr and bool(shx_indices) and is_ocr_available()
+    uncached_shx = [idx for idx in shx_indices if idx not in cached_ocr]
+    ocr_available = enable_ocr and bool(shx_indices) and (bool(cached_ocr) or is_ocr_available())
     subproc_ocr: dict[int, dict[str, Any]] = {}
-    if ocr_available and ocr_subprocess:
-        subproc_ocr = _run_ocr_subprocess(pdf_path, shx_indices, master_max_w)
+    if enable_ocr and uncached_shx and ocr_subprocess and is_ocr_available():
+        subproc_ocr = _run_ocr_subprocess(pdf_path, uncached_shx, master_max_w)
+        for idx, res in subproc_ocr.items():
+            _save_ocr_cache(ocr_cache_dir, sha256, idx + 1, res.get("text", ""), res.get("words", []))
 
     try:
         for idx in range(total_pages):
@@ -734,39 +960,64 @@ def process_single_pdf(job: dict[str, Any]) -> list[dict[str, Any]]:
 
             prev_sheet = existing_by_page.get(page_no) if reparse_only else None
             need_page_ocr = idx in shx_indices
+            has_cached = idx in cached_ocr
             ocr_status = ""
             pil_img: Image.Image | None = None
 
-            # 렌더링이 필요한 경우: 신규 PDF 타일링 OR 인프로세스 OCR
-            need_render = (prev_sheet is None) or (need_page_ocr and ocr_available and not ocr_subprocess)
+            # 렌더링이 필요한 경우: 신규 PDF 타일링 OR 미캐시 인프로세스 OCR
+            need_render = (prev_sheet is None) or (
+                need_page_ocr and not has_cached and ocr_available and not ocr_subprocess
+            )
+            page_for_roi = None
             if need_render:
-                page = doc[idx]
+                page_for_roi = doc[idx]
                 scale = max(0.6, min(master_max_w / max(pw, ph), 3.2))
-                bitmap = page.render(scale=scale, rotation=0)
+                bitmap = page_for_roi.render(scale=scale, rotation=0)
                 pil_img = bitmap.to_pil().convert("RGB")
-                page.close()
+                if not (need_page_ocr and not has_cached and ocr_available and not ocr_subprocess):
+                    page_for_roi.close()
+                    page_for_roi = None
 
-            if need_page_ocr:
-                if ocr_available:
-                    if ocr_subprocess:
-                        ocr_res = subproc_ocr.get(idx)
-                        if ocr_res:
-                            ocr_txt = ocr_res.get("text", "")
-                            ocr_words = ocr_res.get("words", [])
-                            if ocr_txt:
-                                full_text = (full_text + "\n" + ocr_txt).strip()
-                            words = words + ocr_words
-                            ocr_status = "ocr_done"
-                        else:
-                            ocr_status = "shx_pending"
-                    elif pil_img is not None:
-                        ocr_txt, ocr_words = ocr_pil_image(pil_img)
+            try:
+                if need_page_ocr:
+                    if has_cached:
+                        ocr_res = cached_ocr[idx]
+                        ocr_txt = ocr_res.get("text", "")
+                        ocr_words = ocr_res.get("words", [])
                         if ocr_txt:
                             full_text = (full_text + "\n" + ocr_txt).strip()
-                        words = words + ocr_words
+                        words = merge_digital_and_ocr_words(words, ocr_words)
                         ocr_status = "ocr_done"
-                else:
-                    ocr_status = "shx_pending"
+                    elif ocr_available:
+                        if ocr_subprocess:
+                            ocr_res = subproc_ocr.get(idx)
+                            if ocr_res:
+                                ocr_txt = ocr_res.get("text", "")
+                                ocr_words = ocr_res.get("words", [])
+                                if ocr_txt:
+                                    full_text = (full_text + "\n" + ocr_txt).strip()
+                                words = merge_digital_and_ocr_words(words, ocr_words)
+                                ocr_status = "ocr_done"
+                            else:
+                                ocr_status = "shx_pending"
+                        elif pil_img is not None:
+                            ocr_txt, ocr_words = ocr_pil_image(pil_img, pdf_page=page_for_roi)
+                            _save_ocr_cache(ocr_cache_dir, sha256, page_no, ocr_txt, ocr_words)
+                            if ocr_txt:
+                                full_text = (full_text + "\n" + ocr_txt).strip()
+                            words = merge_digital_and_ocr_words(words, ocr_words)
+                            ocr_status = "ocr_done"
+                    else:
+                        ocr_status = "shx_pending"
+            finally:
+                if page_for_roi is not None:
+                    page_for_roi.close()
+
+            # 표/데이터시트/일람표 문맥 보존: 디지털/OCR 단어 좌표 기반 Y-행 클러스터링 텍스트 보강
+            if words and not is_pid:
+                row_txt = reconstruct_row_text(words)
+                if row_txt and len(row_txt) >= max(40, int(len(full_text) * 0.6)):
+                    full_text = row_txt
 
             tags = extract_tags_from_words(words)
             drawing_no, drawing_id, continuations = extract_dwg_meta_and_continuations(
@@ -1099,6 +1350,7 @@ def _write_drawings_db_atomic(
             sid = f"{sid}_{n}"
             s["sheet_id"] = sid
         seen_ids.add(sid)
+    global_snapped = snap_global_ocr_tags(all_sheets)
     _resolve_continuation_targets(all_sheets)
 
     conn = sqlite3.connect(staging, timeout=30)
@@ -1199,6 +1451,8 @@ def _write_drawings_db_atomic(
     meta["total_tags"] = str(total_tags)
     meta["total_continuations"] = str(total_conts)
     meta["ocr_sheets"] = str(ocr_sheets)
+    meta["ocr_global_snapped"] = str(global_snapped)
+    meta["ocr_engine_version"] = str(OCR_ENGINE_VERSION)
     meta["parser_version"] = str(PARSER_VERSION)
     conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", list(meta.items()))
     conn.execute("INSERT INTO sheets_fts(sheets_fts) VALUES('optimize')")
@@ -1227,6 +1481,7 @@ def build_index_incremental(
     reparse_all: bool = False,
     max_delete_ratio: float = 0.30,
     min_delete_guard_pdfs: int = 10,
+    ocr_cache_dir: Path | None = None,
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """SHA-256 비교 기반 증분 인덱싱·타일링·선택적 OCR (Mac 고속 백필 + DS920+ 무인 자동 동기화 공용).
@@ -1238,6 +1493,7 @@ def build_index_incremental(
     started = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
     db_path = out_dir / "drawings.db"
+    eff_ocr_cache = str(ocr_cache_dir) if ocr_cache_dir is not None else str(out_dir / "ocr_cache")
 
     pdfs = sorted(p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf")
     by_hash: dict[str, dict[str, Any]] = {}
@@ -1256,6 +1512,7 @@ def build_index_incremental(
                 "subcategory": sub,
                 "sha256": digest,
                 "out_dir": str(out_dir),
+                "ocr_cache_dir": eff_ocr_cache,
                 "extra_categories": [],
                 "enable_ocr": enable_ocr,
                 "ocr_subprocess": ocr_subprocess,
