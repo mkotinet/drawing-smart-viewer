@@ -1225,6 +1225,8 @@ def build_index_incremental(
     enable_ocr: bool = False,
     ocr_subprocess: bool = False,
     reparse_all: bool = False,
+    max_delete_ratio: float = 0.30,
+    min_delete_guard_pdfs: int = 10,
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """SHA-256 비교 기반 증분 인덱싱·타일링·선택적 OCR (Mac 고속 백필 + DS920+ 무인 자동 동기화 공용).
@@ -1314,6 +1316,18 @@ def build_index_incremental(
 
     removed_shas = [sha for sha in existing_by_sha if sha not in by_hash]
     removed_sheets = [s for sha in removed_shas for s in existing_by_sha[sha]]
+
+    # 대량 삭제 안전장치: 드라이브 마운트 오류·권한 회수 등으로 대량 파일이 갑자기 사라진 경우 파괴적 삭제 차단
+    if (
+        max_delete_ratio > 0
+        and len(existing_by_sha) >= min_delete_guard_pdfs
+        and (len(removed_shas) / len(existing_by_sha)) > max_delete_ratio
+    ):
+        pct = (len(removed_shas) / len(existing_by_sha)) * 100.0
+        raise RuntimeError(
+            f"대량 삭제 안전장치 작동: 기존 {len(existing_by_sha)}개 PDF 중 {len(removed_shas)}개({pct:.1f}%) 삭제 감지 "
+            f"(허용 상한 {max_delete_ratio * 100:.0f}%). 구글 드라이브 폴더·권한 상태를 확인하세요."
+        )
 
     if not new_jobs and not removed_shas and not meta_changed and db_path.is_file():
         elapsed = round(time.perf_counter() - started, 2)

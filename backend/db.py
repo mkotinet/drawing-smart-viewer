@@ -11,6 +11,8 @@ import hmac
 import re
 import secrets
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
@@ -29,8 +31,32 @@ MAX_AUDIT_LOGS = 5000
 PBKDF2_ITERS = 120_000
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 90  # 90일 슬라이딩 만료
 SESSION_TOUCH_INTERVAL_S = 300           # 5분 디바운싱 (타일 요청 쓰기 I/O 99% 절감)
+SESSION_CACHE_TTL_S = 60.0               # 세션 60초 인메모리 캐시 (타일 버스트 SQLite 조회 제거)
+MAX_SESSION_CACHE = 512                  # 256MB 컨테이너 메모리 보호 상한
 _REV_DIR_RE = re.compile(r"(?:AFC|AFD|IFC|REV|R\d|^\d+_P&ID)", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^A-Z0-9]+")
+
+_session_cache_lock = threading.Lock()
+_session_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _hash_session_token(token: str) -> str:
+    """세션 토큰을 DB 저장·조회용 SHA-256 해시로 변환 (DB 유출 시 탈취 방지)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def invalidate_session_cache(token: str | None = None, username: str | None = None) -> None:
+    """로그아웃·계정 삭제·테스트 초기화 시 인메모리 세션 캐시 즉시 무효화."""
+    with _session_cache_lock:
+        if token is None and username is None:
+            _session_cache.clear()
+            return
+        if token is not None:
+            _session_cache.pop(_hash_session_token(token), None)
+        if username is not None:
+            dead = [k for k, (_, sess) in _session_cache.items() if sess.get("username") == username]
+            for k in dead:
+                _session_cache.pop(k, None)
 
 
 def canonicalize_tag(tag: str) -> str:
@@ -55,12 +81,12 @@ def _parse_kst_iso(ts: str) -> datetime | None:
         return None
 
 
-def _tune(conn: sqlite3.Connection, read_only: bool = False) -> None:
+def _tune(conn: sqlite3.Connection, read_only: bool = False, journal_mode: str = "WAL") -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA cache_size=-16000")      # 16MB 상한 (DS920+ RAM 보호)
     conn.execute("PRAGMA temp_store=MEMORY")
     if not read_only:
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA journal_mode={journal_mode}")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
 
@@ -68,7 +94,7 @@ def _tune(conn: sqlite3.Connection, read_only: bool = False) -> None:
 @contextmanager
 def state_conn() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(get_auth_db_path(), timeout=10)
-    _tune(conn)
+    _tune(conn, read_only=False, journal_mode="WAL")
     try:
         yield conn
         conn.commit()
@@ -81,16 +107,36 @@ def state_conn() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def drawings_conn() -> Iterator[sqlite3.Connection]:
+    """도면 인덱스 DB 순수 읽기 전용 커넥션 (DELETE 저널 전제, -wal/-shm 생성 원천 차단)."""
     path = get_db_path()
     if not path.is_file():
-        # 아직 첫 동기화 전: 빈 스키마만 메모리가 아닌 디스크에 초기화
         init_drawings_db(path)
-    conn = sqlite3.connect(path, timeout=10)
-    _tune(conn)
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10)
+    _tune(conn, read_only=True)
     try:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def drawings_write_conn(path=None) -> Iterator[sqlite3.Connection]:
+    """기동·동기화 마이그레이션 전용 쓰기 커넥션 (종료 시 DELETE 저널 모드 강제 유지)."""
+    target = path or get_db_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(target, timeout=15)
+    _tune(conn, read_only=False, journal_mode="DELETE")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+        for suffix in ("-wal", "-shm"):
+            target.with_name(f"{target.name}{suffix}").unlink(missing_ok=True)
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -114,7 +160,7 @@ def init_drawings_db(path=None) -> None:
     target = path or get_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target, timeout=10)
-    _tune(conn)
+    _tune(conn, read_only=False, journal_mode="DELETE")
     try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS meta (
@@ -382,6 +428,7 @@ def init_state_db() -> None:
                     "UPDATE users SET password_hash = ?, role = 'admin' WHERE username = ?",
                     (hash_password(admin_pw), admin_user),
                 )
+                invalidate_session_cache(username=admin_user)
 
 
 def record_audit(username: str | None, action: str, target: str = "",
@@ -401,12 +448,13 @@ def record_audit(username: str | None, action: str, target: str = "",
 
 def create_session(username: str, role: str, ip: str, user_agent: str) -> str:
     token = secrets.token_urlsafe(32)
+    token_hash = _hash_session_token(token)
     now = now_kst_iso()
     with state_conn() as conn:
         conn.execute(
             "INSERT INTO sessions(token, username, role, user_agent, ip, created_at, last_used_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (token, username, role, (user_agent or "")[:200], ip, now, now),
+            (token_hash, username, role, (user_agent or "")[:200], ip, now, now),
         )
     return token
 
@@ -414,30 +462,70 @@ def create_session(username: str, role: str, ip: str, user_agent: str) -> str:
 def get_session(token: str) -> dict[str, Any] | None:
     if not token:
         return None
+    token_hash = _hash_session_token(token)
+    mono_now = time.monotonic()
+    with _session_cache_lock:
+        hit = _session_cache.get(token_hash)
+        if hit is not None:
+            exp_mono, cached = hit
+            if exp_mono > mono_now:
+                return dict(cached)
+            _session_cache.pop(token_hash, None)
+
     with state_conn() as conn:
+        # 해시 토큰 우선 조회 + 구버전 평문 세션 무중단 호환(조회 즉시 해시로 자동 승격)
         row = conn.execute(
-            "SELECT token, username, role, created_at, last_used_at FROM sessions WHERE token = ?",
-            (token,),
+            "SELECT token, username, role, created_at, last_used_at FROM sessions "
+            "WHERE token = ? OR token = ?",
+            (token_hash, token),
         ).fetchone()
         if row is None:
             return None
+        stored_key = row["token"]
         now = now_kst()
         last_dt = _parse_kst_iso(row["last_used_at"])
         if last_dt is not None:
             age_s = (now - last_dt).total_seconds()
             if age_s > SESSION_TTL_SECONDS:
-                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                conn.execute("DELETE FROM sessions WHERE token = ?", (stored_key,))
                 return None
-            # 5분 이내 재조회는 쓰기 트랜잭션 생략 (타일/썸네일 버스트 시 SQLite 쓰기 99% 절감)
-            if age_s >= SESSION_TOUCH_INTERVAL_S:
-                conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (now_kst_iso(), token))
+            if stored_key != token_hash:
+                conn.execute(
+                    "UPDATE sessions SET token = ?, last_used_at = ? WHERE token = ?",
+                    (token_hash, now_kst_iso(), stored_key),
+                )
+            elif age_s >= SESSION_TOUCH_INTERVAL_S:
+                conn.execute(
+                    "UPDATE sessions SET last_used_at = ? WHERE token = ?",
+                    (now_kst_iso(), stored_key),
+                )
         else:
-            conn.execute("UPDATE sessions SET last_used_at = ? WHERE token = ?", (now_kst_iso(), token))
-        return dict(row)
+            conn.execute(
+                "UPDATE sessions SET token = ?, last_used_at = ? WHERE token = ?",
+                (token_hash, now_kst_iso(), stored_key),
+            )
+        sess = {
+            "username": row["username"],
+            "role": row["role"],
+            "created_at": row["created_at"],
+            "last_used_at": row["last_used_at"],
+        }
+
+    with _session_cache_lock:
+        if len(_session_cache) >= MAX_SESSION_CACHE:
+            expired = [k for k, (e, _) in _session_cache.items() if e <= mono_now]
+            for k in expired:
+                _session_cache.pop(k, None)
+            while len(_session_cache) >= MAX_SESSION_CACHE:
+                _session_cache.pop(next(iter(_session_cache)))
+        _session_cache[token_hash] = (mono_now + SESSION_CACHE_TTL_S, sess)
+    return dict(sess)
 
 
 def delete_session(token: str) -> None:
     if not token:
         return
+    token_hash = _hash_session_token(token)
+    invalidate_session_cache(token=token)
     with state_conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.execute("DELETE FROM sessions WHERE token = ? OR token = ?", (token_hash, token))

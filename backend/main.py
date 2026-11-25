@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import hmac
-import io
 import json
+import os
 import re
-import shutil
 import sqlite3
 import tarfile
 import threading
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,11 +41,13 @@ from backend.db import (
     create_session,
     delete_session,
     drawings_conn,
+    drawings_write_conn,
     ensure_drawings_migrations,
     get_session,
     hash_password,
     init_drawings_db,
     init_state_db,
+    invalidate_session_cache,
     record_audit,
     state_conn,
     verify_password,
@@ -56,40 +58,89 @@ SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 MAX_SYNC_UPLOAD_BYTES = 64 * 1024 * 1024     # 단일 청크 최대 64MB
 MAX_SYNC_EXTRACT_BYTES = 192 * 1024 * 1024   # 압축 해제 누적 최대 192MB (Tar Bomb 방어)
 LOGIN_RATE_LIMIT_MAX = 10
-LOGIN_RATE_LIMIT_WINDOW_S = 900              # 15분당 IP별 실패 10회 상한
+LOGIN_RATE_LIMIT_WINDOW_S = 900              # 15분당 IP / (IP, 계정)별 실패 10회 상한
+MAX_RATE_LIMIT_KEYS = 2048                   # 256MB 컨테이너 메모리 OOM 방지 상한
+USER_FAIL_SLOWDOWN_THRESHOLD = 5             # 분산 계정 추측 감지 시 지연 임계치 (정상 IP 잠금 DoS 방지)
+USER_FAIL_SLOWDOWN_S = 0.4
+_DUMMY_PASSWORD_HASH = hash_password("dsv-dummy-timing-guard-v1")
 _login_fail_lock = threading.Lock()
 _login_fails: dict[str, deque[float]] = {}
+_user_fails: dict[str, deque[float]] = {}
+_sync_upload_lock = threading.Lock()
 
 
-def _check_login_rate_limit(ip: str) -> bool:
-    """허용 시 True, 차단 시 False."""
-    now = time.monotonic()
-    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_S
-    with _login_fail_lock:
-        q = _login_fails.get(ip)
-        if not q:
-            return True
+def _prune_store(store: dict[str, deque[float]], cutoff: float) -> None:
+    expired_keys = []
+    for k, q in store.items():
         while q and q[0] < cutoff:
             q.popleft()
         if not q:
-            _login_fails.pop(ip, None)
-            return True
-        return len(q) < LOGIN_RATE_LIMIT_MAX
+            expired_keys.append(k)
+    for k in expired_keys:
+        store.pop(k, None)
+    while len(store) >= MAX_RATE_LIMIT_KEYS:
+        store.pop(next(iter(store)))
 
 
-def _record_login_failure(ip: str) -> None:
+def _check_login_rate_limit(ip: str, username: str = "") -> bool:
+    """허용 시 True, 차단 시 False (IP 및 (IP, 계정) 복합 키 차단 — 타 IP 관리자 잠금 DoS 방지)."""
     now = time.monotonic()
     cutoff = now - LOGIN_RATE_LIMIT_WINDOW_S
+    keys = [f"ip:{ip}"]
+    if username:
+        keys.append(f"pair:{ip}:{username}")
     with _login_fail_lock:
-        q = _login_fails.setdefault(ip, deque())
-        while q and q[0] < cutoff:
-            q.popleft()
-        q.append(now)
+        for key in keys:
+            q = _login_fails.get(key)
+            if not q:
+                continue
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                _login_fails.pop(key, None)
+                continue
+            if len(q) >= LOGIN_RATE_LIMIT_MAX:
+                return False
+        return True
 
 
-def _clear_login_failures(ip: str) -> None:
+def _record_login_failure(ip: str, username: str = "") -> int:
+    """실패 이력을 기록하고, 동일 계정의 최근 전체 실패 횟수를 반환."""
+    now = time.monotonic()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_S
+    keys = [f"ip:{ip}"]
+    if username:
+        keys.append(f"pair:{ip}:{username}")
     with _login_fail_lock:
-        _login_fails.pop(ip, None)
+        if len(_login_fails) >= MAX_RATE_LIMIT_KEYS:
+            _prune_store(_login_fails, cutoff)
+        for key in keys:
+            q = _login_fails.setdefault(key, deque())
+            while q and q[0] < cutoff:
+                q.popleft()
+            q.append(now)
+        user_count = 0
+        if username:
+            if len(_user_fails) >= MAX_RATE_LIMIT_KEYS:
+                _prune_store(_user_fails, cutoff)
+            uq = _user_fails.setdefault(username, deque())
+            while uq and uq[0] < cutoff:
+                uq.popleft()
+            uq.append(now)
+            user_count = len(uq)
+        return user_count
+
+
+def _clear_login_failures(ip: str, username: str = "") -> None:
+    with _login_fail_lock:
+        _login_fails.pop(f"ip:{ip}", None)
+        if username:
+            _login_fails.pop(f"pair:{ip}:{username}", None)
+
+
+def _escape_like(raw: str) -> str:
+    """SQLite LIKE 와일드카드(_, %, \\) 이스케이프 (ESCAPE '\\'와 함께 사용)."""
+    return raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @asynccontextmanager
@@ -98,13 +149,12 @@ async def _lifespan(_app: FastAPI):
     if not get_db_path().is_file():
         init_drawings_db()
     else:
-        with drawings_conn() as conn:
+        with drawings_write_conn() as conn:
             ensure_drawings_migrations(conn)
-            conn.commit()
     yield
 
 
-app = FastAPI(title="도면 스마트 뷰어", version="1.3.0", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title="도면 스마트 뷰어", version="1.3.1", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -123,9 +173,7 @@ async def _security_headers(request: Request, call_next):
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """신뢰 프록시 CIDR만 허용한 Uvicorn ProxyHeadersMiddleware 결과를 사용 (XFF 스푸핑 차단)."""
     return request.client.host if request.client else ""
 
 
@@ -285,7 +333,7 @@ def login(body: LoginBody, request: Request, response: Response) -> dict[str, An
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")
     username = body.username.strip()
-    if not _check_login_rate_limit(ip):
+    if not _check_login_rate_limit(ip, username):
         record_audit(username, "login_rate_limited", ip=ip, user_agent=ua)
         raise HTTPException(status_code=429, detail="로그인 시도가 너무 많습니다. 15분 후 다시 시도해 주세요")
 
@@ -293,12 +341,26 @@ def login(body: LoginBody, request: Request, response: Response) -> dict[str, An
         row = conn.execute(
             "SELECT username, password_hash, role FROM users WHERE username = ?", (username,)
         ).fetchone()
-    if row is None or not verify_password(body.password, row["password_hash"]):
-        _record_login_failure(ip)
-        record_audit(username, "login_failed", ip=ip, user_agent=ua)
+    if row is None:
+        # 존재하지 않는 아이디에도 동일 비용 PBKDF2 수행 (타이밍 계정 열거 방지)
+        verify_password(body.password, _DUMMY_PASSWORD_HASH)
+        ok = False
+    else:
+        ok = verify_password(body.password, row["password_hash"])
+    if not ok:
+        user_fail_cnt = _record_login_failure(ip, username)
+        record_audit(
+            username,
+            "login_failed",
+            ip=ip,
+            user_agent=ua,
+            detail=f"user_window_fails={user_fail_cnt}" if user_fail_cnt >= USER_FAIL_SLOWDOWN_THRESHOLD else "",
+        )
+        if user_fail_cnt >= USER_FAIL_SLOWDOWN_THRESHOLD:
+            time.sleep(USER_FAIL_SLOWDOWN_S)
         raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 일치하지 않습니다")
 
-    _clear_login_failures(ip)
+    _clear_login_failures(ip, username)
     token = create_session(row["username"], row["role"], ip, ua)
     record_audit(row["username"], "login_success", ip=ip, user_agent=ua)
     is_https = (
@@ -448,7 +510,7 @@ def list_drawings(
             fts = _fts_query(q_clean)
             tri = _trigram_query(q_clean)
             canon_q = canonicalize_tag(q_clean)
-            like = f"%{q_clean}%"
+            like = f"%{_escape_like(q_clean)}%"
             where_sql = (" AND " + " AND ".join(where)) if where else ""
 
             # 1) 초고속 하이브리드 후보 시트 집합 수집 (FTS5 + Trigram 부분검색 + 정규화 태그 + 표제란)
@@ -481,24 +543,30 @@ def list_drawings(
                     except sqlite3.OperationalError:
                         pass
 
-            # 정규화 태그 / 루프 키 매칭 (TCV-N2USCW31 ↔ TCV_N2USCW31, N2USCW31, 061213)
+            # 정규화 태그 / 루프 키 인덱스 직접 매칭 (O(log N); 부분 일치는 sheets_trigram으로 50ms 풀스캔 제거)
             if len(canon_q) >= 2:
                 for r in conn.execute(
                     "SELECT DISTINCT sheet_id FROM tags WHERE canonical_tag = ?", (canon_q,)
                 ).fetchall():
                     exact_tag_ids.add(r[0])
                     matched_ids.add(r[0])
-                if len(canon_q) >= 3:
-                    clike = f"%{canon_q}%"
+                for r in conn.execute(
+                    "SELECT DISTINCT sheet_id FROM tags WHERE loop_key = ?", (q_clean.upper(),)
+                ).fetchall():
+                    matched_ids.add(r[0])
+                if not has_trigram and len(canon_q) >= 3:
+                    clike = f"%{_escape_like(canon_q)}%"
                     for r in conn.execute(
-                        "SELECT DISTINCT sheet_id FROM tags WHERE canonical_tag LIKE ? OR loop_key LIKE ?",
+                        "SELECT DISTINCT sheet_id FROM tags "
+                        "WHERE canonical_tag LIKE ? ESCAPE '\\' OR loop_key LIKE ? ESCAPE '\\'",
                         (clike, like.upper()),
                     ).fetchall():
                         matched_ids.add(r[0])
 
             # 제목·도면번호·도면ID 직접 매칭
             for r in conn.execute(
-                "SELECT sheet_id FROM sheets WHERE title LIKE ? OR drawing_no LIKE ? OR drawing_id LIKE ?",
+                "SELECT sheet_id FROM sheets "
+                "WHERE title LIKE ? ESCAPE '\\' OR drawing_no LIKE ? ESCAPE '\\' OR drawing_id LIKE ? ESCAPE '\\'",
                 (like, like, like),
             ).fetchall():
                 matched_ids.add(r[0])
@@ -529,9 +597,10 @@ def list_drawings(
                 WHERE s.sheet_id IN ({ph})
                 {where_sql}
                 ORDER BY
-                    CASE WHEN UPPER(COALESCE(s.drawing_no, '')) LIKE UPPER(?) OR UPPER(COALESCE(s.drawing_id, '')) LIKE UPPER(?) THEN 0
+                    CASE WHEN UPPER(COALESCE(s.drawing_no, '')) LIKE UPPER(?) ESCAPE '\\'
+                           OR UPPER(COALESCE(s.drawing_id, '')) LIKE UPPER(?) ESCAPE '\\' THEN 0
                          {exact_case}
-                         WHEN UPPER(s.title) LIKE UPPER(?) THEN 2 ELSE 3 END,
+                         WHEN UPPER(s.title) LIKE UPPER(?) ESCAPE '\\' THEN 2 ELSE 3 END,
                     s.category, s.title, s.page_no
                 LIMIT ? OFFSET ?
                 """,
@@ -700,7 +769,7 @@ def get_drawing_detail(sheet_id: str, request: Request, user: dict[str, Any] = D
 def search_tags(
     q: str = Query(default="", max_length=100),
     kind: str = Query(default="", max_length=40),
-    func: str = Query(default="", max_length=16),
+    tag_func: str = Query(default="", alias="func", max_length=16),
     limit: int = Query(default=80, ge=1, le=200),
     user: dict[str, Any] = Depends(require_user),
 ) -> dict[str, Any]:
@@ -708,23 +777,26 @@ def search_tags(
     params: list[Any] = []
     q_clean = q.strip()
     if q_clean:
-        like = f"%{q_clean}%"
+        like = f"%{_escape_like(q_clean)}%"
         canon = canonicalize_tag(q_clean)
         if canon:
-            clike = f"%{canon}%"
+            clike = f"%{_escape_like(canon)}%"
             where.append(
-                "(t.canonical_tag LIKE ? OR t.loop_key LIKE ? OR UPPER(t.tag) LIKE UPPER(?) OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?))"
+                "(t.canonical_tag LIKE ? ESCAPE '\\' OR t.loop_key LIKE ? ESCAPE '\\' "
+                "OR UPPER(t.tag) LIKE UPPER(?) ESCAPE '\\' OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?) ESCAPE '\\')"
             )
             params.extend([clike, like.upper(), like, like])
         else:
-            where.append("(UPPER(t.tag) LIKE UPPER(?) OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?))")
+            where.append(
+                "(UPPER(t.tag) LIKE UPPER(?) ESCAPE '\\' OR UPPER(COALESCE(t.raw_text, '')) LIKE UPPER(?) ESCAPE '\\')"
+            )
             params.extend([like, like])
     if kind:
         where.append("t.kind = ?")
         params.append(kind)
-    if func:
+    if tag_func:
         where.append("UPPER(t.func) = UPPER(?)")
-        params.append(func)
+        params.append(tag_func)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     with drawings_conn() as conn:
@@ -963,71 +1035,117 @@ def _authorize_sync(request: Request) -> str:
     raise HTTPException(status_code=401, detail="동기화 인증이 필요합니다")
 
 
+def _extract_sync_bundle(fileobj, data_dir: Path) -> tuple[int, int]:
+    """동기화 tar.gz 번들을 스트리밍 2단계 검증 후 원자 반영 (스레드풀 + 직렬화 락)."""
+    allowed_roots = {"drawings.db", "tiles", "thumbs", "pdfs"}
+    fileobj.seek(0, os.SEEK_END)
+    upload_bytes = fileobj.tell()
+    fileobj.seek(0)
+    if upload_bytes > MAX_SYNC_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="동기화 번들 크기가 64MB 상한을 초과했습니다")
+
+    with _sync_upload_lock:
+        try:
+            with tarfile.open(fileobj=fileobj, mode="r:gz") as tf:
+                # Phase 1: 디스크에 단 1바이트도 쓰기 전에 전체 멤버 보안·용량 사전 검증
+                declared_total = 0
+                dirs_to_create: list[Path] = []
+                asset_members: list[tuple[tarfile.TarInfo, Path]] = []
+                db_member: tarfile.TarInfo | None = None
+
+                for member in tf.getmembers():
+                    if not (member.isfile() or member.isdir()):
+                        raise HTTPException(status_code=400, detail=f"허용되지 않는 아카이브 항목: {member.name}")
+                    if member.size < 0 or declared_total + member.size > MAX_SYNC_EXTRACT_BYTES:
+                        raise HTTPException(status_code=413, detail="아카이브 압축 해제 총량이 192MB 상한을 초과했습니다")
+
+                    rel = Path(member.name)
+                    if member.isdir() and not rel.parts:
+                        continue  # tar 루트 '.' 엔트리 허용
+                    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+                        raise HTTPException(status_code=400, detail=f"경로 조작 차단: {member.name}")
+                    if rel.parts[0] not in allowed_roots:
+                        raise HTTPException(status_code=400, detail=f"허용되지 않은 최상위 경로: {rel.parts[0]}")
+
+                    dest = (data_dir / rel).resolve()
+                    if data_dir not in dest.parents and dest != data_dir:
+                        raise HTTPException(status_code=400, detail=f"경로 이탈 차단: {member.name}")
+
+                    declared_total += member.size
+                    if member.isdir():
+                        dirs_to_create.append(dest)
+                    elif rel.as_posix() == "drawings.db":
+                        db_member = member
+                    else:
+                        asset_members.append((member, dest))
+
+                # Phase 2: 에셋(타일·썸네일·PDF) 먼저 원자 기록 후, drawings.db를 가장 마지막에 교체
+                extracted = 0
+                written_bytes = 0
+                for d in dirs_to_create:
+                    d.mkdir(parents=True, exist_ok=True)
+
+                for member, dest in asset_members:
+                    fobj = tf.extractfile(member)
+                    if fobj is None:
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_f = dest.with_name(f".{dest.name}.tmp")
+                    try:
+                        with open(tmp_f, "wb") as out:
+                            while chunk := fobj.read(65536):
+                                written_bytes += len(chunk)
+                                if written_bytes > MAX_SYNC_EXTRACT_BYTES:
+                                    raise HTTPException(status_code=413, detail="아카이브 압축 해제 총량이 192MB 상한을 초과했습니다")
+                                out.write(chunk)
+                        tmp_f.replace(dest)
+                    except BaseException:
+                        tmp_f.unlink(missing_ok=True)
+                        raise
+                    extracted += 1
+
+                if db_member is not None:
+                    fobj = tf.extractfile(db_member)
+                    if fobj is not None:
+                        tmp_db = data_dir / ".drawings.db.incoming"
+                        try:
+                            with open(tmp_db, "wb") as out:
+                                while chunk := fobj.read(65536):
+                                    written_bytes += len(chunk)
+                                    if written_bytes > MAX_SYNC_EXTRACT_BYTES:
+                                        raise HTTPException(status_code=413, detail="아카이브 압축 해제 총량이 192MB 상한을 초과했습니다")
+                                    out.write(chunk)
+                            for suffix in ("-wal", "-shm"):
+                                (data_dir / f"drawings.db{suffix}").unlink(missing_ok=True)
+                            tmp_db.replace(data_dir / "drawings.db")
+                        except BaseException:
+                            tmp_db.unlink(missing_ok=True)
+                            raise
+                        with drawings_write_conn() as dconn:
+                            ensure_drawings_migrations(dconn)
+                        extracted += 1
+        except tarfile.TarError as exc:
+            raise HTTPException(status_code=400, detail=f"손상된 tar.gz 번들: {exc}") from exc
+
+    return extracted, upload_bytes
+
+
 @app.post("/api/admin/sync")
 async def upload_sync_bundle(
     request: Request,
     bundle: UploadFile = File(...),
-    replace_db: bool = Query(default=False),
 ) -> dict[str, Any]:
     """로컬 PC에서 생성한 tar.gz 번들(drawings.db, tiles/, thumbs/, pdfs/)을 안전하게 반영."""
     actor = _authorize_sync(request)
     data_dir = get_data_dir().resolve()
-    allowed_roots = {"drawings.db", "tiles", "thumbs", "pdfs"}
-    extracted = 0
-
-    raw = await bundle.read(MAX_SYNC_UPLOAD_BYTES + 1)
-    if len(raw) > MAX_SYNC_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="동기화 번들 크기가 64MB 상한을 초과했습니다")
-    extracted_bytes = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-            for member in tf.getmembers():
-                if not (member.isfile() or member.isdir()):
-                    raise HTTPException(status_code=400, detail=f"허용되지 않는 아카이브 항목: {member.name}")
-                if member.size < 0 or extracted_bytes + member.size > MAX_SYNC_EXTRACT_BYTES:
-                    raise HTTPException(status_code=413, detail="아카이브 압축 해제 총량이 192MB 상한을 초과했습니다")
-                rel = Path(member.name)
-                if rel.is_absolute() or ".." in rel.parts or not rel.parts:
-                    raise HTTPException(status_code=400, detail=f"경로 조작 차단: {member.name}")
-                if rel.parts[0] not in allowed_roots:
-                    raise HTTPException(status_code=400, detail=f"허용되지 않은 최상위 경로: {rel.parts[0]}")
-
-                dest = (data_dir / rel).resolve()
-                if data_dir not in dest.parents and dest != data_dir:
-                    raise HTTPException(status_code=400, detail=f"경로 이탈 차단: {member.name}")
-
-                if member.isdir():
-                    dest.mkdir(parents=True, exist_ok=True)
-                    continue
-
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                fobj = tf.extractfile(member)
-                if fobj is None:
-                    continue
-                if member.name == "drawings.db":
-                    tmp_db = data_dir / ".drawings.db.incoming"
-                    with open(tmp_db, "wb") as out:
-                        shutil.copyfileobj(fobj, out)
-                    # 기존 WAL/SHM 정리 후 원자적 교체 + v1.2.0 인덱스 보장
-                    for suffix in ("-wal", "-shm"):
-                        (data_dir / f"drawings.db{suffix}").unlink(missing_ok=True)
-                    tmp_db.replace(data_dir / "drawings.db")
-                    with drawings_conn() as dconn:
-                        ensure_drawings_migrations(dconn)
-                        dconn.commit()
-                else:
-                    tmp_f = dest.with_name(f".{dest.name}.tmp")
-                    with open(tmp_f, "wb") as out:
-                        shutil.copyfileobj(fobj, out)
-                    tmp_f.replace(dest)
-                extracted_bytes += member.size
-                extracted += 1
-    except tarfile.TarError as exc:
-        raise HTTPException(status_code=400, detail=f"손상된 tar.gz 번들: {exc}") from exc
+        extracted, upload_bytes = await run_in_threadpool(_extract_sync_bundle, bundle.file, data_dir)
+    finally:
+        await bundle.close()
 
     record_audit(actor, "admin_sync", target=bundle.filename or "bundle.tar.gz",
-                 ip=_client_ip(request), detail=f"extracted={extracted}, bytes={len(raw)}, replace_db={replace_db}")
-    return {"status": "ok", "extracted_files": extracted, "bytes": len(raw)}
+                 ip=_client_ip(request), detail=f"extracted={extracted}, bytes={upload_bytes}")
+    return {"status": "ok", "extracted_files": extracted, "bytes": upload_bytes}
 
 
 def _call_worker(path: str, method: str = "GET", timeout: int = 12) -> dict[str, Any]:
@@ -1146,6 +1264,7 @@ def delete_user(username: str, request: Request,
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="계정을 찾을 수 없습니다")
         conn.execute("DELETE FROM sessions WHERE username = ?", (uname,))
+    invalidate_session_cache(username=uname)
     record_audit(admin["username"], "delete_user", target=uname, ip=_client_ip(request))
     return {"status": "ok", "deleted": uname}
 

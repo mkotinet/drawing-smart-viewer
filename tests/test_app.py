@@ -15,8 +15,11 @@ from backend.main import app
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    from backend.main import _login_fails
+    from backend.db import invalidate_session_cache
+    from backend.main import _login_fails, _user_fails
     _login_fails.clear()
+    _user_fails.clear()
+    invalidate_session_cache()
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ADMIN_USER", "admin")
     monkeypatch.setenv("ADMIN_PASSWORD", "testpass123")
@@ -27,6 +30,8 @@ def client(tmp_path, monkeypatch):
     with TestClient(app) as c:
         yield c, tmp_path
     _login_fails.clear()
+    _user_fails.clear()
+    invalidate_session_cache()
 
 
 def _make_tar(files: dict[str, bytes]) -> bytes:
@@ -448,3 +453,192 @@ def test_v130_plant_parser_trigram_substring_lineage_and_continuations(client, t
     det_a = c.get("/api/drawings/PID_006A", headers=hdr).json()
     assert len(det_a["incoming_continuations"]) == 1
     assert det_a["incoming_continuations"][0]["from_sheet_id"] == "PID_006R"
+
+
+def test_v131_security_hardening_session_hash_cache_and_xff_spoof_block(client, monkeypatch):
+    import hashlib
+    import backend.main as main_mod
+    from backend.config import get_auth_db_path, now_kst_iso
+
+    c, _ = client
+
+    # 1) 존재하지 않는 계정 로그인 시에도 더미 PBKDF2 수행 (타이밍 계정 열거 방어)
+    calls = {"n": 0}
+    orig_verify = main_mod.verify_password
+
+    def _spy_verify(pw, stored):
+        calls["n"] += 1
+        return orig_verify(pw, stored)
+
+    monkeypatch.setattr(main_mod, "verify_password", _spy_verify)
+    monkeypatch.setattr(main_mod, "USER_FAIL_SLOWDOWN_S", 0.0)
+    r_ghost = c.post("/api/auth/login", json={"username": "no_such_user_xyz", "password": "wrong"})
+    assert r_ghost.status_code == 401
+    assert calls["n"] == 1
+    monkeypatch.setattr(main_mod, "verify_password", orig_verify)
+
+    # 2) 타 IP에서 admin 12회 실패해도 정상 IP(testclient) 로그인은 잠기지 않음 (계정 잠금 DoS 방지)
+    for _ in range(12):
+        main_mod._record_login_failure("203.0.113.77", "admin")
+    r_ok = c.post("/api/auth/login", json={"username": "admin", "password": "testpass123"})
+    assert r_ok.status_code == 200
+    admin_tok = r_ok.json()["token"]
+    admin_hdr = {"Authorization": f"Bearer {admin_tok}"}
+
+    # 3) DB에는 평문 토큰 대신 SHA-256 해시만 저장
+    sconn = sqlite3.connect(get_auth_db_path())
+    stored_tokens = {r[0] for r in sconn.execute("SELECT token FROM sessions").fetchall()}
+    assert admin_tok not in stored_tokens
+    assert hashlib.sha256(admin_tok.encode("utf-8")).hexdigest() in stored_tokens
+
+    # 4) 구버전 평문 세션 무중단 호환 + 첫 조회 시 해시 자동 승격
+    legacy_tok = "legacy-plain-session-token-001"
+    now_s = now_kst_iso()
+    sconn.execute(
+        "INSERT INTO sessions(token, username, role, user_agent, ip, created_at, last_used_at) "
+        "VALUES (?, 'admin', 'admin', 'mobile', '127.0.0.1', ?, ?)",
+        (legacy_tok, now_s, now_s),
+    )
+    sconn.commit()
+    sconn.close()
+    assert c.get("/api/auth/me", headers={"Authorization": f"Bearer {legacy_tok}"}).status_code == 200
+    sconn = sqlite3.connect(get_auth_db_path())
+    upgraded_tokens = {r[0] for r in sconn.execute("SELECT token FROM sessions").fetchall()}
+    sconn.close()
+    assert legacy_tok not in upgraded_tokens
+    assert hashlib.sha256(legacy_tok.encode("utf-8")).hexdigest() in upgraded_tokens
+
+    # 5) 60초 세션 캐시 적중 상태에서 계정 삭제·로그아웃 즉시 무효화
+    assert c.post(
+        "/api/admin/users",
+        json={"username": "eng_cache", "password": "user1234", "role": "engineer"},
+        headers=admin_hdr,
+    ).status_code == 200
+    eng_tok = c.post("/api/auth/login", json={"username": "eng_cache", "password": "user1234"}).json()["token"]
+    eng_hdr = {"Authorization": f"Bearer {eng_tok}"}
+    assert c.get("/api/auth/me", headers=eng_hdr).status_code == 200  # 캐시 채움
+    assert c.delete("/api/admin/users/eng_cache", headers=admin_hdr).status_code == 200
+    assert c.get("/api/auth/me", headers=eng_hdr).status_code == 401  # 즉시 무효화 확인
+
+    assert c.post("/api/auth/logout", headers={"Authorization": f"Bearer {legacy_tok}"}).status_code == 200
+    assert c.get("/api/auth/me", headers={"Authorization": f"Bearer {legacy_tok}"}).status_code == 401
+
+    # 6) X-Forwarded-For 위조 헤더를 매번 바꿔도 레이트 리밋 우회 불가
+    main_mod._login_fails.clear()
+    for i in range(10):
+        resp = c.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "bad"},
+            headers={"X-Forwarded-For": f"198.51.100.{i + 1}"},
+        )
+        assert resp.status_code == 401
+    blocked = c.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "bad"},
+        headers={"X-Forwarded-For": "198.51.100.250"},
+    )
+    assert blocked.status_code == 429
+
+    # 7) 레이트 리밋 딕셔너리 메모리 상한 캡 검증
+    main_mod._login_fails.clear()
+    for i in range(main_mod.MAX_RATE_LIMIT_KEYS + 200):
+        main_mod._record_login_failure(f"10.0.{i // 256}.{i % 256}")
+    assert len(main_mod._login_fails) <= main_mod.MAX_RATE_LIMIT_KEYS + 1
+
+
+def test_v131_sync_2phase_atomicity_dotslash_db_ro_mode_and_like_escape(client, tmp_path):
+    c, data_dir = client
+
+    # 1) 2단계 사전 검증: 정상 파일 뒤에 경로 이탈 항목이 있어도 선행 파일이 디스크에 남지 않음
+    poison_tar = _make_tar({
+        "thumbs/SHOULD_NOT_BE_WRITTEN.webp": b"RIFFxxxxWEBP",
+        "../escape.txt": b"evil",
+    })
+    r_bad = c.post(
+        "/api/admin/sync",
+        headers={"X-Sync-Token": "sync-secret-xyz"},
+        files={"bundle": ("poison.tar.gz", poison_tar, "application/gzip")},
+    )
+    assert r_bad.status_code == 400
+    assert not (data_dir / "thumbs" / "SHOULD_NOT_BE_WRITTEN.webp").exists()
+
+    # 2) ./drawings.db 정규화 + 기존 -wal/-shm 정리 + 읽기 전용 mode=ro에서 DELETE 저널 유지
+    stage_db = tmp_path / "dotslash.db"
+    init_drawings_db(stage_db)
+    conn = sqlite3.connect(stage_db)
+    conn.execute(
+        "INSERT INTO sheets(sheet_id, category, subcategory, drawing_no, title, source_file, file_type, "
+        "width_px, height_px, sha256, has_preview, tag_count) "
+        "VALUES ('ESC_1', '제어 도면', 'HCD', 'DW-1', 'UNIT_A_B', 'a.pdf', 'pdf', 1000, 800, '1111aaaa', 1, 0)"
+    )
+    conn.execute(
+        "INSERT INTO sheets(sheet_id, category, subcategory, drawing_no, title, source_file, file_type, "
+        "width_px, height_px, sha256, has_preview, tag_count) "
+        "VALUES ('ESC_2', '제어 도면', 'HCD', 'DW-2', 'UNIT_AXB', 'b.pdf', 'pdf', 1000, 800, '2222bbbb', 1, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    (data_dir / "drawings.db-wal").write_bytes(b"stale-wal")
+    (data_dir / "drawings.db-shm").write_bytes(b"stale-shm")
+    dotslash_tar = _make_tar({"./drawings.db": stage_db.read_bytes()})
+    r_ok = c.post(
+        "/api/admin/sync",
+        headers={"X-Sync-Token": "sync-secret-xyz"},
+        files={"bundle": ("dotslash.tar.gz", dotslash_tar, "application/gzip")},
+    )
+    assert r_ok.status_code == 200 and r_ok.json()["extracted_files"] == 1
+    assert not (data_dir / "drawings.db-wal").exists()
+    assert not (data_dir / "drawings.db-shm").exists()
+
+    # 읽기 API 호출 후에도 -wal/-shm이 재생성되지 않으며 DELETE 저널 유지
+    tok = c.post("/api/auth/login", json={"username": "admin", "password": "testpass123"}).json()["token"]
+    hdr = {"Authorization": f"Bearer {tok}"}
+    st = c.get("/api/stats", headers=hdr)
+    assert st.status_code == 200 and st.json()["total_sheets"] == 2
+    assert not (data_dir / "drawings.db-wal").exists()
+    assert not (data_dir / "drawings.db-shm").exists()
+    chk = sqlite3.connect(data_dir / "drawings.db")
+    assert chk.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    chk.close()
+
+    # 3) LIKE 와일드카드('_') 이스케이프: 'UNIT_A_B' 검색 시 'UNIT_AXB' 오매칭 차단
+    res = c.get("/api/drawings?q=UNIT_A_B", headers=hdr).json()
+    assert [it["sheet_id"] for it in res["items"]] == ["ESC_1"]
+
+
+def test_v131_mass_delete_safety_guard_and_mobile_sidebar_css(tmp_path):
+    from pypdf import PdfWriter
+    from scripts.build_index import build_index_incremental
+
+    raw_dir = tmp_path / "raw" / "2_AFC_0" / "4_P&ID"
+    raw_dir.mkdir(parents=True)
+    out_dir = tmp_path / "out"
+
+    pdfs: list[Path] = []
+    for i in range(10):
+        p = raw_dir / f"sheet_{i:02d}.pdf"
+        w = PdfWriter()
+        w.add_blank_page(width=400 + i * 10, height=300)
+        with open(p, "wb") as f:
+            w.write(f)
+        pdfs.append(p)
+
+    r1 = build_index_incremental(tmp_path / "raw", out_dir, workers=1, project_name="안전장치테스트")
+    assert r1["total_sheets"] == 10
+    assert len(list((out_dir / "thumbs").glob("*.webp"))) == 10
+
+    # 10개 중 5개(50% > 30% 상한) 갑작스런 삭제 시 예외로 차단 및 기존 데이터 100% 보존
+    for p in pdfs[:5]:
+        p.unlink()
+    with pytest.raises(RuntimeError, match="대량 삭제 안전장치"):
+        build_index_incremental(tmp_path / "raw", out_dir, workers=1, project_name="안전장치테스트")
+    assert len(list((out_dir / "thumbs").glob("*.webp"))) == 10
+
+    # 모바일 좌측 사이드바 단일 스크롤 CSS 규칙 존재 확인
+    css = (Path(__file__).resolve().parents[1] / "frontend" / "static" / "style.css").read_text(encoding="utf-8")
+    mobile_section = css.split("@media (max-width: 900px)")[-1]
+    assert "overflow-y: auto;" in mobile_section
+    assert "overscroll-behavior: contain;" in mobile_section
+    assert "position: sticky;" in mobile_section
+    assert "overflow-y: visible;" in mobile_section

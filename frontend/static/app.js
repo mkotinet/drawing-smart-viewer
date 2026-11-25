@@ -6,7 +6,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.3.0';
+  const APP_VERSION = '1.3.1';
   const USER_KEY = 'dsv_auth_user';
   const THEME_KEY = 'dsv_theme';
   const TILE_CACHE_NAME = 'dsv-tiles-v1.0.0';
@@ -1138,6 +1138,8 @@
         });
         state.tab = btn.dataset.tab;
         state.page = 1;
+        $('sidebar').scrollTop = 0;
+        $('listContainer').scrollTop = 0;
         refreshList();
       });
     });
@@ -1170,8 +1172,19 @@
       refreshList();
     });
 
-    $('btnPrevPage').addEventListener('click', () => { if (state.page > 1) { state.page--; refreshList(); } });
-    $('btnNextPage').addEventListener('click', () => { if (state.page < state.totalPages) { state.page++; refreshList(); } });
+    const scrollListToTop = () => {
+      if (window.innerWidth <= 900) {
+        $('listMeta')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      } else {
+        $('listContainer').scrollTop = 0;
+      }
+    };
+    $('btnPrevPage').addEventListener('click', () => {
+      if (state.page > 1) { state.page--; refreshList().then(scrollListToTop); }
+    });
+    $('btnNextPage').addEventListener('click', () => {
+      if (state.page < state.totalPages) { state.page++; refreshList().then(scrollListToTop); }
+    });
 
     $('btnZoomIn').addEventListener('click', () => {
       const r = $('canvasViewport').getBoundingClientRect();

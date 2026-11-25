@@ -9,10 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+COPY requirements-worker.txt /app/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates tzdata rclone libgomp1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pypdfium2 pillow pypdf rapidocr onnxruntime
+    && pip install --no-cache-dir -r /app/requirements-worker.txt
 
 COPY backend ./backend
 COPY scripts ./scripts

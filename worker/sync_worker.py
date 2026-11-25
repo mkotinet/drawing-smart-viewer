@@ -50,6 +50,8 @@ WORKER_PORT = int(os.environ.get("WORKER_PORT", "8099"))
 BATCH_COMMIT = max(1, int(os.environ.get("BATCH_COMMIT", "20")))
 SHEET_SLEEP = max(0.0, float(os.environ.get("SHEET_SLEEP", "0.15")))
 ENABLE_OCR = os.environ.get("ENABLE_OCR", "true").strip().lower() not in {"0", "false", "no", "off"}
+RCLONE_MAX_DELETE = max(0, int(os.environ.get("RCLONE_MAX_DELETE", "50")))
+MAX_DELETE_RATIO = max(0.0, float(os.environ.get("MAX_DELETE_RATIO", "0.30")))
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 VIEWER_PUBLIC_URL = os.environ.get("VIEWER_PUBLIC_URL", "").strip()
 
@@ -155,6 +157,7 @@ def _run_rclone_sync(conf_path: Path, started_at: str) -> dict[str, Any]:
         extra_flags = ["--drive-root-folder-id", GDRIVE_ROOT_FOLDER_ID]
 
     # 주의: Google Drive 서브경로에서 --fast-list 사용 시 전체 드라이브를 풀스캔하므로 배제
+    max_del_flags = ["--max-delete", str(RCLONE_MAX_DELETE)] if RCLONE_MAX_DELETE > 0 else []
     cmd = [
         "rclone", "sync",
         remote_arg,
@@ -164,6 +167,7 @@ def _run_rclone_sync(conf_path: Path, started_at: str) -> dict[str, Any]:
         "--ignore-case",
         "--include", "*.pdf",
         "--delete-excluded",
+        *max_del_flags,
         "--transfers", "3",
         "--checkers", "6",
         "--contimeout", "30s",
@@ -248,6 +252,7 @@ def run_sync_cycle(reason: str = "scheduled", force_notify: bool = False) -> dic
             sheet_sleep=SHEET_SLEEP,
             enable_ocr=ENABLE_OCR,
             ocr_subprocess=True,
+            max_delete_ratio=MAX_DELETE_RATIO,
             progress_cb=on_progress,
         )
         summary.update(rclone_info)
